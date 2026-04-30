@@ -1,0 +1,22 @@
+[Unit]
+Description=MCTP loopback address setup for PLDM terminus testing
+# Run after mctpi2c1 is up so the full MCTP net is established.
+After=mctp-setup-i2c.service
+Wants=mctp-setup-i2c.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+
+# Add BMC EID 8 on lo so pldmtool (inside QEMU) can reach pldmd via loopback.
+ExecStart=-/usr/bin/mctp addr add 8 dev lo
+
+# Add terminus EID 10 on lo (where pldm-terminus will bind).
+ExecStart=-/usr/bin/mctp addr add 10 dev lo
+
+# Add static MCTP neighbor for EID 10 on lo so the kernel routes
+# pldmd's outbound requests to EID 10 via the loopback interface.
+ExecStart=-/usr/bin/mctp neigh add 10 dev lo lladdr 00:00:00:00:00:00
+
+[Install]
+WantedBy=multi-user.target

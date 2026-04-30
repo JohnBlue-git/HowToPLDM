@@ -1,0 +1,29 @@
+[Unit]
+Description=MCTP I2C transport setup for QEMU AST2600 (i2c-1)
+# Start after mctpd is active; stop if mctpd stops.
+After=mctpd.service
+Before=pldmd.service
+BindTo=mctpd.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+
+# The mctp-i2c driver (CONFIG_MCTP_TRANSPORT_I2C=y, built-in) checks for the
+# "mctp-controller" OF property on the adapter to create the mctpi2cN netdev.
+# The DTS patch adds that property to i2c1, but the kernel notifier only fires
+# for adapters registered AFTER the mctp-i2c init runs (init order is i2c before
+# net, so aspeed adapters are already registered by then). We must trigger probe
+# manually via new_device so its bus_for_each_dev scan finds i2c-1.
+# NOTE: the i2c_device_id name is "mctp-i2c-interface", NOT "mctp-i2c".
+ExecStart=-/bin/sh -c 'echo "mctp-i2c-interface 0x0f" > /sys/bus/i2c/devices/i2c-1/new_device'
+
+# Wait for the probe to complete and mctpi2c1 netdev to appear (asynchronous).
+ExecStart=/bin/sh -c 'for i in $(seq 1 10); do [ -d /sys/class/net/mctpi2c1 ] && exit 0; sleep 1; done; echo "mctpi2c1 did not appear" >&2; exit 1'
+
+# Bring the MCTP I2C netdev up and assign BMC EID = 8.
+ExecStart=/usr/bin/mctp link set mctpi2c1 up
+ExecStart=/usr/bin/mctp addr add 8 dev mctpi2c1
+
+[Install]
+WantedBy=mctpd.service

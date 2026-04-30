@@ -1,0 +1,13 @@
+[Unit]
+Description=PLDM base terminus responder (EID 10, MCTP loopback)
+After=mctp-lo-setup.service
+BindTo=mctp-lo-setup.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/pldm-terminus
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

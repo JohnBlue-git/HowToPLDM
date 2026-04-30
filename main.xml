@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<manifest>
+  <remote name="openbmc" fetch="https://github.com/" />
+  <remote name="johnblue" fetch="https://github.com/JohnBlue-git/" />
+
+  <default remote="johnblue" revision="main" sync-j="4" />
+
+  <project remote="openbmc" name="openbmc/openbmc" revision="master" path="openbmc" />
+  <project remote="johnblue" name="HowToPLDM" revision="main" path="openbmc/meta-johnblue" />
+</manifest>

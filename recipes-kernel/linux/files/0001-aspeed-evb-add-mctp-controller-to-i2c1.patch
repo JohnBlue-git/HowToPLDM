@@ -1,0 +1,34 @@
+From 0000000000000000000000000000000000000001 Mon Sep 17 00:00:00 2001
+From: johnblue <dev@johnblue.local>
+Date: Wed, 29 Apr 2026 00:00:00 +0000
+Subject: [PATCH] arm: dts: aspeed: ast2600-evb: add mctp-controller to i2c1
+
+Upstream-Status: Inappropriate [QEMU development environment only]
+
+The mctp-i2c driver checks for the "mctp-controller" OF property on the
+I2C adapter before creating the mctpi2cN netdev (via both probe and the
+i2c bus notifier).  Without this property the netdev is never created and
+MCTP over I2C is non-functional.
+
+Add the property to bus 1 so that the driver creates mctpi2c1 on boot,
+enabling MCTP over I2C for the QEMU AST2600 EVB environment.
+
+Signed-off-by: johnblue <dev@johnblue.local>
+---
+ arch/arm/boot/dts/aspeed/aspeed-ast2600-evb.dts | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/arch/arm/boot/dts/aspeed/aspeed-ast2600-evb.dts b/arch/arm/boot/dts/aspeed/aspeed-ast2600-evb.dts
+index 0000000..0000001 100644
+--- a/arch/arm/boot/dts/aspeed/aspeed-ast2600-evb.dts
++++ b/arch/arm/boot/dts/aspeed/aspeed-ast2600-evb.dts
+@@ -215,6 +215,7 @@
+ 
+ &i2c1 {
+ 	status = "okay";
++	mctp-controller;
+ };
+ 
+ &i2c2 {
+-- 
+2.34.1
