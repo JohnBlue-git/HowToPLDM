@@ -5,6 +5,6 @@
 
   <default remote="johnblue" revision="main" sync-j="4" />
 
-  <project remote="openbmc" name="openbmc/openbmc" revision="master" path="openbmc" />
-  <project remote="johnblue" name="HowToPLDM" revision="main" path="openbmc/meta-johnblue" />
+  <project remote="openbmc" name="openbmc/openbmc" revision="master" path="." />
+  <project remote="johnblue" name="HowToPLDM" revision="main" path="meta-johnblue" />
 </manifest>
