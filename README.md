@@ -194,6 +194,203 @@ Due to the mocking nature, **do NOT expect**:
 
 This is a **demonstration and testing framework only**.
 
+## Build and Run with QEMU
+
+Follow these steps to build the OpenBMC image with the meta-johnblue layer and run it in QEMU.
+
+### 1. Setup johnblue Layer
+
+After syncing the manifest with `repo sync`, the `meta-johnblue` layer is checked out at `meta-johnblue/`.
+
+The `meta-johnblue` layer is already included in the provided configuration sample. To set it up:
+
+#### Option A: Use the Provided Configuration Sample (Recommended)
+
+```bash
+# Copy the provided bblayers.conf.sample to your build configuration
+cp meta-johnblue/conf/templates/default/bblayers.conf.sample build/conf/bblayers.conf
+
+# Also copy local.conf.sample if you haven't set it up yet
+cp meta-johnblue/conf/templates/default/local.conf.sample build/conf/local.conf
+```
+
+The `bblayers.conf.sample` file already includes the `meta-johnblue` layer:
+
+```bash
+# From meta-johnblue/conf/templates/default/bblayers.conf.sample
+BBLAYERS ?= " \
+  ##OEROOT##/meta \
+  ##OEROOT##/meta-openembedded/meta-oe \
+  ##OEROOT##/meta-openembedded/meta-networking \
+  ##OEROOT##/meta-openembedded/meta-python \
+  ##OEROOT##/meta-phosphor \
+  ##OEROOT##/meta-aspeed \
+  ##OEROOT##/meta-evb/meta-evb-aspeed/meta-evb-ast2600 \
+  ##OEROOT##/meta-johnblue \
+  "
+```
+
+Set the machine in local.conf:
+
+```bash
+# build/conf/local.conf
+MACHINE = "johnblue"
+```
+
+#### Option B: Manual Setup
+
+If you already have `build/conf/bblayers.conf`, add the layer manually:
+
+```bash
+# Edit build/conf/bblayers.conf
+# Add to BBLAYERS:
+BBLAYERS += "${TOPDIR}/../meta-johnblue"
+```
+
+Or use `bitbake-layers`:
+
+```bash
+cd build
+bitbake-layers add-layer ../meta-johnblue
+```
+
+### 2. Build the OpenBMC Image
+
+From the OpenBMC root directory, set up the build environment and build the firmware image:
+
+```bash
+# Initialize build environment (if not already done)
+source setup
+
+# Build the phosphor image with the meta-johnblue layer
+bitbake obmc-phosphor-image
+```
+
+This will:
+- Compile OpenBMC with the meta-johnblue layer's PLDM terminus mock
+- MCTP loopback services
+- All necessary dependencies
+
+**Build time**: This can take 30 minutes to an hour depending on system performance. 
+
+**Output**: The built image will be located in:
+```
+build/tmp/deploy/images/johnblue/
+```
+
+Look for files like:
+- `obmc-phosphor-image-johnblue.rootfs.mtdimage`
+- `obmc-phosphor-image-johnblue.rootfs.tar.bz2`
+- `zImage-*`
+
+### 3. Run QEMU
+
+Once the build completes, run QEMU with the built image:
+
+```bash
+# From the OpenBMC build directory
+runqemu johnblue slirp nographic
+```
+
+Or with more control:
+
+```bash
+# Specify the machine and build directory explicitly
+runqemu build/tmp/deploy/images/johnblue/ johnblue slirp nographic
+```
+
+**QEMU Options** (optional - runqemu handles defaults):
+
+```bash
+# Run with TCP serial console (easier to use)
+runqemu johnblue serial tcp nographic
+
+# Run with more verbose output
+runqemu johnblue kvm nographic
+
+# Run with USB networking (if needed)
+runqemu johnblue net nic,model=e1000
+```
+
+### 4. Access the QEMU BMC Console
+
+Once QEMU starts, you'll see boot messages. Wait for the login prompt:
+
+```
+johnblue login:
+```
+
+**Default credentials:**
+- Username: `root`
+- Password: `0penBmc` (or no password if configured)
+
+**Or use SSH** (after QEMU boots):
+
+```bash
+# From your host machine (in another terminal)
+ssh root@192.168.7.2
+# Replace IP if different - check QEMU network config
+```
+
+### 5. Verify Services in QEMU
+
+Once logged into the QEMU BMC, verify the mocking services are running:
+
+```bash
+# Check MCTP loopback setup
+mctp addr show
+# Expected: EID 8 (BMC) and 10 (mock terminus) on device "lo"
+
+# Check PLDM terminus mock
+systemctl status pldm-terminus.service
+systemctl status pldmd.service
+
+# View logs
+journalctl -u pldm-terminus.service -n 20
+journalctl -u pldmd.service -n 20
+```
+
+### 6. Exit QEMU
+
+To stop QEMU:
+
+```bash
+# Inside QEMU BMC shell, run:
+poweroff
+
+# Or from host machine (if running in background), use Ctrl+C or:
+pkill qemu
+```
+
+### Troubleshooting Build Issues
+
+**If `bitbake` fails:**
+```bash
+# Clear previous build state
+bitbake -c cleanall obmc-phosphor-image
+
+# Retry build
+bitbake obmc-phosphor-image
+```
+
+**If `runqemu` cannot find the image:**
+```bash
+# Verify image exists
+ls -la build/tmp/deploy/images/johnblue/
+
+# Check if johnblue machine configuration is found
+find . -name "johnblue.conf"
+```
+
+**If QEMU fails to boot:**
+```bash
+# Check for kernel/dtb issues
+ls -la build/tmp/deploy/images/johnblue/
+
+# Try with different QEMU options
+runqemu qemuarm johnblue nographic
+```
+
 ## How to Verify
 
 ⚠️ **IMPORTANT**: Due to the mocking design, these verification steps test the PLDM discovery and loopback stack only, NOT real platform management or sensor data.
@@ -284,14 +481,14 @@ busctl status xyz.openbmc_project.PLDM
 systemctl status pldmd.service
 
 # 5. Test pldmtool discovery (will work via mock)
-pldmtool base GetTID -t 1 -d 10
+pldmtool base GetTID -m 10
 # Expected: Returns TID=1 (mock response)
 
-pldmtool base GetPLDMTypes -t 1 -d 10
+pldmtool base GetPLDMTypes -m 10
 # Expected: Returns types bitmap showing only base type (mock response)
 
-pldmtool base GetPLDMVersion -t 1 -d 10
-# Expected: Returns version 1.1.0 (mock response)
+pldmtool base GetPLDMVersion -m 10 -t 0
+# Expected: Returns version 1.1.0 (mock response) (-t 0 = PLDM base type)
 
 # 6. ❌ Do NOT expect real sensor data
 pldmtool platform GetSensorReadings
