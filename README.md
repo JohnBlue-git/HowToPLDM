@@ -474,6 +474,7 @@ mctp neigh show
 
 # 3. Check pldm-terminus process is running
 ps aux | grep pldm-terminus
+systemctl status pldm-terminus.service
 # Expected: /usr/bin/pldm-terminus running
 
 # 4. Verify pldmd bound to BMC EID 8
