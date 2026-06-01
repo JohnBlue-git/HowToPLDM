@@ -21,9 +21,15 @@ ExecStart=-/bin/sh -c 'echo "mctp-i2c-interface 0x0f" > /sys/bus/i2c/devices/i2c
 # Wait for the probe to complete and mctpi2c1 netdev to appear (asynchronous).
 ExecStart=/bin/sh -c 'for i in $(seq 1 10); do [ -d /sys/class/net/mctpi2c1 ] && exit 0; sleep 1; done; echo "mctpi2c1 did not appear" >&2; exit 1'
 
-# Bring the MCTP I2C netdev up and assign BMC EID = 8.
+# Bring the MCTP I2C netdev up.
+# NOTE: BMC EID 8 is intentionally NOT added here.
+# mctp-lo-setup.service adds EID 10 first (making it addrs[0]) and then EID 8
+# (addrs[1]). The kernel always uses addrs[0] as the source EID for outgoing
+# packets (mctp_local_output). EID 10 must be addrs[0] so that loopback
+# responses from pldm-terminus carry src=10, matching pldmd's waiting key
+# {local=10, peer=10}. If EID 8 were addrs[0], responses would carry src=8
+# and mctp_key_match would fail.
 ExecStart=/usr/bin/mctp link set mctpi2c1 up
-ExecStart=/usr/bin/mctp addr add 8 dev mctpi2c1
 
 [Install]
 WantedBy=mctpd.service

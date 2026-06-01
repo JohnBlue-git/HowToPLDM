@@ -72,6 +72,57 @@ Sensor/Terminus → MCTP → PLDM → BMC/OpenBMC Services
 
 This design allows for scalable, interoperable platform management using industry standards.
 
+## What are MCTP and PLDM?
+
+- **MCTP (Management Component Transport Protocol)** is the transport layer for platform management traffic. It carries management messages between endpoints and provides addressing, packet framing, and transport services over underlying buses such as I2C, PCIe, SMBus, or loopback.
+- **PLDM (Platform Level Data Model)** is a higher-layer protocol that runs on top of MCTP. PLDM defines standard platform management commands, discovery, sensor readouts, firmware update procedures, and other data model semantics.
+- In this repo, PLDM messages are transported over MCTP using AF_MCTP sockets. `mctpd`, `mctp-setup-i2c.service`, and `mctp-lo-setup.service` establish the MCTP transport, while `pldmd.service` and `pldm-terminus.service` exchange PLDM payloads over that transport.
+
+## MCTP / PLDM Device and Service Relationship
+
+The current mock stack is designed to make the PLDM services runnable in QEMU by using a local MCTP transport and a mock terminus device.
+
+- **BMC side (EID 8)**
+  - `mctpd`: MCTP bus owner daemon
+  - `mctp-setup-i2c.service`: manually probes the MCTP I2C adapter and brings up `mctpi2c1`
+  - `mctp-lo-setup.service`: adds MCTP addresses for EID 10 first, then EID 8
+  - `pldmd.service`: PLDM daemon on the BMC
+- **Terminus side (EID 10)**
+  - `pldm-terminus.service`: mock PLDM terminus responder bound to AF_MCTP EID 10
+
+**Service startup chain:**
+
+```
+mctpd
+  └─ mctp-setup-i2c.service  # create mctpi2c1 and bring it up
+       └─ mctp-lo-setup.service  # add EID 10 then EID 8 on mctpi2c1
+             ├─ pldm-terminus.service  # mock terminus at EID 10
+             └─ pldmd.service  # BMC PLDM daemon at EID 8
+```
+
+**Service relation diagram:**
+
+```
+[ mctpd ]
+    |
+    v
+[ mctp-setup-i2c.service ]
+    |
+    v
+[ mctp-lo-setup.service ]
+   /                     \
+  v                       v
+[pldm-terminus.service] [pldmd.service]
+```
+
+- `mctpd` provides the base MCTP transport.
+- `mctp-setup-i2c.service` creates the `mctpi2c1` transport device.
+- `mctp-lo-setup.service` adds MCTP endpoint addresses for EID 10 and EID 8.
+- `pldm-terminus.service` is the mock PLDM responder at EID 10.
+- `pldmd.service` is the BMC-side PLDM daemon at EID 8.
+
+The key runtime fix is the ordered service startup: `mctp-setup-i2c.service` must create the transport first, then `mctp-lo-setup.service` adds the addresses in the correct order so loopback replies from the mock terminus can be matched by `pldmd`.
+
 ---
 
 ## ⚠️ Important: MOCKING IMPLEMENTATION FOR TESTING ONLY
@@ -122,6 +173,7 @@ The MCTP layer is configured for loopback testing only:
   - Terminus EID 10 on `lo`
   - Static neighbor route to EID 10 via loopback (all traffic is local)
 - **This is purely virtual routing for testing**, not connected to any real transport
+- The service order is important: `mctp-setup-i2c.service` creates the transport first, then `mctp-lo-setup.service` adds MCTP addresses so `pldm-terminus` can bind correctly before `pldmd` starts.
 
 ### Why This Mocking Design?
 

@@ -2,6 +2,8 @@
 Description=PLDM base terminus responder (EID 10, MCTP loopback)
 After=mctp-lo-setup.service
 BindTo=mctp-lo-setup.service
+# Must be running before pldmd's initial GetPLDMVersion probe.
+Before=pldmd.service
 
 [Service]
 Type=simple

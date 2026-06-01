@@ -134,11 +134,22 @@ int main(void)
                 resp[6] = 0x00; resp[7] = 0x00;
                 /* TransferFlag = 0x05 (Start and End) */
                 resp[8] = 0x05;
-                /* PLDM base spec version 1.1.0: encoded as F1 F1 F0 00 */
-                resp[9]  = 0xF1;
-                resp[10] = 0xF1;
-                resp[11] = 0xF0;
-                resp[12] = 0x00;
+                /*
+                 * ver32_t layout in memory: alpha, update, minor, major.
+                 * Version 1.1.0 (F-prefixed BCD, no alpha suffix):
+                 *   alpha  = 0x00  (no alpha suffix)
+                 *   update = 0xF0  (patch = 0)
+                 *   minor  = 0xF1  (minor = 1)
+                 *   major  = 0xF1  (major = 1)
+                 * pldm_base_ver2str decodes {0x00,0xF0,0xF1,0xF1} -> "1.1.0".
+                 * DO NOT send {0xF1,0xF1,0xF0,0x00}: that sets alpha=0xF1,
+                 * causing pldm_base_ver2str to append raw byte 0xF1 which
+                 * is not valid UTF-8, crashing pldmtool's JSON encoder.
+                 */
+                resp[9]  = 0x00;  /* alpha  (no suffix) */
+                resp[10] = 0xF0;  /* update (0)         */
+                resp[11] = 0xF1;  /* minor  (1)         */
+                resp[12] = 0xF1;  /* major  (1)         */
                 rlen = 13;
                 break;
 
@@ -153,8 +164,19 @@ int main(void)
         }
 
         if (rlen > 0) {
-            /* Response: clear MCTP_TAG_OWNER (TO=0, tag value preserved) */
-            peer.smctp_tag &= ~MCTP_TAG_OWNER;
+            /*
+             * Response: keep ONLY the raw tag value (bits 0-2), clear all
+             * flag bits (MCTP_TAG_OWNER, MCTP_TAG_PREALLOC).
+             *
+             * The kernel (mctp_local_output) takes the non-OWNER branch:
+             *   tag = req_tag & MCTP_TAG_MASK  →  TO=0 on the wire
+             * This is a correct MCTP response (TO=0, same tag as request).
+             *
+             * NOTE: MCTP_TAG_PREALLOC without MCTP_TAG_OWNER is explicitly
+             * rejected by the kernel with EINVAL ("can't preallocate a
+             * non-owned tag").
+             */
+            peer.smctp_tag &= MCTP_TAG_MASK;
             if (sendto(fd, resp, rlen, 0,
                        (struct sockaddr *)&peer, peerlen) < 0)
                 perror("sendto");
