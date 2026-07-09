@@ -1,0 +1,857 @@
+--- a/hw/i2c/mctp_i2c_endpoint.c
++++ b/hw/i2c/mctp_i2c_endpoint.c
+@@ -0,0 +1,854 @@
++/*
++ * MCTP-over-SMBus/I2C Endpoint Device Model
++ *
++ * Implements a QEMU I2C slave device that speaks:
++ *   - DSP0237: MCTP over SMBus/I2C Transport Binding (framing)
++ *   - DSP0236: MCTP Control Protocol (Type 0) - EID assignment
++ *   - DSP0240: PLDM Base (Type 0) - GetTID, GetPLDMTypes, GetPLDMVersion
++ *   - DSP0248: PLDM PMC (Type 2) - GetPDRRepositoryInfo, GetPDR,
++ *                                   GetSensorReading
++ *
++ * This device is placed on the same I2C bus as the kernel's mctp-i2c
++ * master driver.  When mctpd discovers the bus it:
++ *   1. Sends SetEndpointID (MCTP Control Type 0, cmd 0x01)
++ *   2. Sends GetEndpointID (cmd 0x02) to confirm
++ * After discovery pldmd (platform-mc) can do a full PLDM PDR walk and
++ * poll GetSensorReading.
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#include "qemu/osdep.h"
++#include "qemu/log.h"
++#include "qemu/module.h"
++#include "qemu/bswap.h"
++#include "hw/i2c/i2c.h"
++#include "hw/i2c/mctp_i2c_endpoint.h"
++#include "qom/object.h"
++
++/* -----------------------------------------------------------------------
++ * Wire-level constants (DSP0237)
++ * --------------------------------------------------------------------- */
++
++/* I2C slave address for THIS endpoint as seen on the bus (7-bit) */
++#define TERMINUS_I2C_ADDR       0x0f
++
++/* The BMC's I2C slave address (7-bit) – mctp-i2c driver default */
++#define BMC_I2C_SLAVE_ADDR      0x10
++
++/* MCTP header version */
++#define MCTP_HDR_VER            0x01
++
++/* MCTP message type bytes */
++#define MCTP_TYPE_CONTROL       0x00
++#define MCTP_TYPE_PLDM          0x01
++
++/* MCTP Control command codes */
++#define MCTP_CTRL_CMD_SET_EID   0x01
++#define MCTP_CTRL_CMD_GET_EID   0x02
++#define MCTP_CTRL_CMD_GET_UUID  0x03
++#define MCTP_CTRL_CMD_GET_VER   0x04
++#define MCTP_CTRL_CMD_GET_TYPES 0x05
++
++/* MCTP Control completion codes */
++#define MCTP_CC_SUCCESS         0x00
++#define MCTP_CC_UNSUPPORTED_CMD 0x05
++
++/* MCTP tag field bits */
++#define MCTP_TAG_OWNER          (1 << 3)
++#define MCTP_TAG_SOM            (1 << 7)
++#define MCTP_TAG_EOM            (1 << 6)
++#define MCTP_TAG_SEQ_SHIFT      4
++#define MCTP_TAG_MASK           0x07
++
++/* PLDM Base (Type 0) command codes */
++#define PLDM_CMD_GET_TID        0x02
++#define PLDM_CMD_GET_TYPES      0x04
++#define PLDM_CMD_GET_VER        0x03
++
++/* PLDM PMC (Type 2) command codes */
++#define PLDM_CMD_GET_PDR_INFO   0x50
++#define PLDM_CMD_GET_PDR        0x51
++#define PLDM_CMD_GET_READING    0x11
++
++/* PLDM completion codes */
++#define PLDM_CC_SUCCESS         0x00
++#define PLDM_CC_INVALID_TYPE    0x83
++#define PLDM_CC_UNSUPPORTED_CMD 0x05
++#define PLDM_CC_INVALID_SENSOR  0x80
++
++/* PLDM Terminus ID for this simulated device */
++#define SIMULATED_TID           0x01
++
++/* PLDM sensor IDs we expose */
++#define SENSOR_ID_TEMP_CPU      0x0001
++#define SENSOR_ID_VOLT_12V      0x0002
++
++/* -----------------------------------------------------------------------
++ * DSP0248 NumericSensorPDR layout (simplified – only fields we populate)
++ * --------------------------------------------------------------------- */
++
++/* PDR header: 11 bytes */
++typedef struct __attribute__((packed)) {
++    uint32_t record_handle;
++    uint8_t  version;
++    uint8_t  type;        /* PDR type: 0x02 = NumericSensor */
++    uint16_t record_change_num;
++    uint16_t data_length;
++} PDRHeader;
++
++/* Numeric Sensor PDR body (minimal set of mandatory fields) */
++typedef struct __attribute__((packed)) {
++    /* identification */
++    uint16_t terminus_handle;     /* 0 = this terminus */
++    uint16_t sensor_id;
++    uint16_t entity_type;
++    uint16_t entity_instance;
++    uint8_t  container_id;        /* 0 */
++    uint8_t  sensor_init;         /* 0x01 = enabled */
++    uint8_t  sensor_auxiliary_names_pdr; /* 0 */
++    /* data info */
++    uint8_t  base_unit;           /* 2 = degrees C, 5 = volts */
++    int8_t   unit_modifier;       /* 0 */
++    uint8_t  rate_unit;           /* 0 = none */
++    uint8_t  base_oem_unit_handle;/* 0 */
++    uint8_t  aux_unit;            /* 0 */
++    int8_t   aux_unit_modifier;   /* 0 */
++    uint8_t  aux_rate_unit;       /* 0 */
++    uint8_t  is_linear;           /* 1 = linear */
++    uint8_t  sensor_data_size;    /* 2 = uint16 */
++    float    resolution;          /* 1.0 */
++    float    offset;              /* 0.0 */
++    uint16_t accuracy;
++    uint8_t  plus_tolerance;
++    uint8_t  minus_tolerance;
++    uint32_t hysteresis;
++    uint8_t  supported_thresholds;
++    uint8_t  threshold_and_hysteresis_volatility;
++    float    state_transition_interval;
++    float    update_interval;
++    uint32_t max_readable;
++    uint32_t min_readable;
++    uint8_t  range_field_format;  /* 2 = uint16 */
++    uint8_t  range_field_support;
++    uint16_t nominal_value;
++    uint16_t normal_max;
++    uint16_t normal_min;
++    uint16_t warning_high;
++    uint16_t warning_low;
++    uint16_t critical_high;
++    uint16_t critical_low;
++    uint16_t fatal_high;
++    uint16_t fatal_low;
++} PDRNumericSensor;
++
++/* Complete PDR record */
++typedef struct __attribute__((packed)) {
++    PDRHeader          hdr;
++    PDRNumericSensor   body;
++} PDRNumericRecord;
++
++/* -----------------------------------------------------------------------
++ * Static PDR repository (2 sensors)
++ * --------------------------------------------------------------------- */
++
++static const PDRNumericRecord pdr_repo[2] = {
++    /* Record 0: CPU temperature */
++    {
++        .hdr = {
++            .record_handle    = 1,
++            .version          = 0x01,
++            .type             = 0x02,  /* Numeric Sensor PDR */
++            .record_change_num = 0,
++            .data_length      = sizeof(PDRNumericSensor),
++        },
++        .body = {
++            .terminus_handle  = 0,
++            .sensor_id        = SENSOR_ID_TEMP_CPU,
++            .entity_type      = 0x0023, /* 35 = Processor */
++            .entity_instance  = 1,
++            .container_id     = 0,
++            .sensor_init      = 0x01,
++            .base_unit        = 0x02,   /* degrees C */
++            .unit_modifier    = 0,
++            .is_linear        = 1,
++            .sensor_data_size = 0x02,   /* uint16 */
++            .resolution       = 1.0f,
++            .offset           = 0.0f,
++            .update_interval  = 1.0f,
++            .max_readable     = 125,
++            .min_readable     = 0,
++            .range_field_format = 0x02,
++            .nominal_value    = 30,
++            .normal_max       = 80,
++            .normal_min       = 10,
++            .warning_high     = 90,
++            .warning_low      = 5,
++            .critical_high    = 100,
++            .critical_low     = 0,
++            .fatal_high       = 125,
++            .fatal_low        = 0,
++        },
++    },
++    /* Record 1: 12V rail voltage */
++    {
++        .hdr = {
++            .record_handle    = 2,
++            .version          = 0x01,
++            .type             = 0x02,
++            .record_change_num = 0,
++            .data_length      = sizeof(PDRNumericSensor),
++        },
++        .body = {
++            .terminus_handle  = 0,
++            .sensor_id        = SENSOR_ID_VOLT_12V,
++            .entity_type      = 0x0018, /* 24 = Power Supply */
++            .entity_instance  = 1,
++            .container_id     = 0,
++            .sensor_init      = 0x01,
++            .base_unit        = 0x05,   /* volts */
++            .unit_modifier    = -2,     /* scale ×0.01 → reading 1200 = 12.00V */
++            .is_linear        = 1,
++            .sensor_data_size = 0x02,
++            .resolution       = 0.01f,
++            .offset           = 0.0f,
++            .update_interval  = 1.0f,
++            .max_readable     = 1300,
++            .min_readable     = 1100,
++            .range_field_format = 0x02,
++            .nominal_value    = 1200,
++            .normal_max       = 1260,
++            .normal_min       = 1140,
++            .warning_high     = 1270,
++            .warning_low      = 1130,
++            .critical_high    = 1280,
++            .critical_low     = 1120,
++            .fatal_high       = 1300,
++            .fatal_low        = 1100,
++        },
++    },
++};
++
++#define PDR_COUNT  (sizeof(pdr_repo) / sizeof(pdr_repo[0]))
++
++/* -----------------------------------------------------------------------
++ * CRC-8 (SMBus PEC polynomial 0x07)
++ * --------------------------------------------------------------------- */
++
++static uint8_t crc8_smbus(const uint8_t *data, size_t len)
++{
++    uint8_t crc = 0x00;
++    for (size_t i = 0; i < len; i++) {
++        crc ^= data[i];
++        for (int j = 0; j < 8; j++) {
++            if (crc & 0x80) {
++                crc = (crc << 1) ^ 0x07;
++            } else {
++                crc <<= 1;
++            }
++        }
++    }
++    return crc;
++}
++
++/* -----------------------------------------------------------------------
++ * Frame builder: prepend DSP0237 SMBus header + append PEC
++ *
++ * Layout of resp_buf:
++ *   [0]  byte_count       = total_bytes − 1  (excluding byte_count itself)
++ *   [1]  source_addr<<1|1 = (TERMINUS_I2C_ADDR << 1) | 1
++ *   [2]  flags_hdr_ver    = SOM|EOM (0xC0) | hdr_ver (0x01) = 0xC1
++ *   [3]  dest_eid
++ *   [4]  src_eid  (our EID)
++ *   [5]  tag_field (TO=0, same tag as request)
++ *   [6+] mctp_payload
++ *   [-1] PEC
++ *
++ * The PEC covers the entire I2C transaction:
++ *   dest_i2c_addr<<1  (write to BMC slave addr)
++ *   + all bytes above
++ * --------------------------------------------------------------------- */
++
++static uint16_t build_mctp_frame(MCTPEndpointState *s,
++                                 uint8_t dest_eid, uint8_t src_eid,
++                                 uint8_t tag,
++                                 const uint8_t *payload, uint16_t plen)
++{
++    uint8_t *b = s->resp_buf;
++    uint16_t idx = 0;
++
++    /* SMBus header */
++    uint8_t total_bytes = 1 /* src_addr */ + 4 /* hdr */ + plen + 1 /* PEC */;
++    b[idx++] = total_bytes;                     /* byte_count */
++    b[idx++] = (TERMINUS_I2C_ADDR << 1) | 0x01;/* src_slave_addr */
++    b[idx++] = 0xC0 | MCTP_HDR_VER;            /* flags: SOM+EOM + ver */
++    b[idx++] = dest_eid;
++    b[idx++] = src_eid;
++    b[idx++] = tag & MCTP_TAG_MASK;            /* TO=0, same tag */
++
++    /* MCTP payload */
++    memcpy(&b[idx], payload, plen);
++    idx += plen;
++
++    /* PEC over: (BMC_slave_addr<<1)|0 || byte_count ... payload */
++    uint8_t pec_buf[MCTP_MAX_I2C_FRAME + 1];
++    pec_buf[0] = (BMC_I2C_SLAVE_ADDR << 1) & 0xFE; /* write address */
++    memcpy(&pec_buf[1], b, idx);
++    b[idx++] = crc8_smbus(pec_buf, 1 + idx - 1);
++
++    return idx;
++}
++
++/* -----------------------------------------------------------------------
++ * MCTP Control protocol handler
++ * --------------------------------------------------------------------- */
++
++static uint16_t handle_mctp_control(MCTPEndpointState *s,
++                                    uint8_t dest_eid, uint8_t src_eid,
++                                    uint8_t tag,
++                                    const uint8_t *msg, uint16_t mlen)
++{
++    /*
++     * MCTP Control message layout (after the type byte stripped by caller):
++     *   [0] Rq(7)|D(6)|rsvd(5:5)|instance_id(4:0)
++     *   [1] command code
++     *   [2+] command data
++     */
++    if (mlen < 2) {
++        return 0;
++    }
++
++    uint8_t instance_id = msg[0] & 0x1f;
++    uint8_t cmd         = msg[1];
++
++    uint8_t payload[32];
++    uint16_t plen = 0;
++
++    /* Response: type byte + control header + body */
++    payload[plen++] = MCTP_TYPE_CONTROL;        /* IC=0 message type */
++    payload[plen++] = instance_id;              /* Rq=0, same instance_id */
++    payload[plen++] = cmd;
++
++    switch (cmd) {
++
++    case MCTP_CTRL_CMD_SET_EID: {
++        /*
++         * Request: [2]=operation [3]=eid_value
++         * Response: CC(1) status(1) eid_setting(1) eid_pool_size(1)
++         */
++        if (mlen < 4) {
++            payload[plen++] = MCTP_CC_UNSUPPORTED_CMD;
++            break;
++        }
++        uint8_t new_eid = msg[3];
++        if (new_eid != 0x00 && new_eid != 0xff) {
++            s->eid = new_eid;
++        }
++        payload[plen++] = MCTP_CC_SUCCESS;
++        payload[plen++] = 0x00;     /* no EID pool, assignment accepted */
++        payload[plen++] = s->eid;   /* current EID */
++        payload[plen++] = 0x00;     /* pool size */
++        break;
++    }
++
++    case MCTP_CTRL_CMD_GET_EID:
++        /*
++         * Response: CC(1) eid(1) eid_type(1) medium_specific(1)
++         */
++        payload[plen++] = MCTP_CC_SUCCESS;
++        payload[plen++] = s->eid;
++        payload[plen++] = 0x00;     /* simple endpoint, not bus owner */
++        payload[plen++] = 0x00;
++        break;
++
++    case MCTP_CTRL_CMD_GET_TYPES: {
++        /*
++         * Response: CC(1) count(1) type_list(N)
++         */
++        payload[plen++] = MCTP_CC_SUCCESS;
++        payload[plen++] = 2;         /* 2 message types */
++        payload[plen++] = MCTP_TYPE_CONTROL;
++        payload[plen++] = MCTP_TYPE_PLDM;
++        break;
++    }
++
++    case MCTP_CTRL_CMD_GET_VER: {
++        /*
++         * Request: [2]=msg_type_number
++         * Response: CC(1) ver_count(1) ver_fields(4*N)
++         * Version field (4 bytes BCD): major.minor.update.alpha
++         */
++        if (mlen < 3) {
++            payload[plen++] = MCTP_CC_UNSUPPORTED_CMD;
++            break;
++        }
++        uint8_t qtype = msg[2];
++        payload[plen++] = MCTP_CC_SUCCESS;
++        payload[plen++] = 1;        /* 1 version entry */
++        if (qtype == 0xff) {
++            /* MCTP Base Protocol */
++            payload[plen++] = 0xf1; payload[plen++] = 0xf3;
++            payload[plen++] = 0xf1; payload[plen++] = 0x00;
++        } else if (qtype == MCTP_TYPE_PLDM) {
++            payload[plen++] = 0xf1; payload[plen++] = 0xf0;
++            payload[plen++] = 0xf0; payload[plen++] = 0x00;
++        } else {
++            /* Override: return success but zeroed version */
++            payload[plen++] = 0xf1; payload[plen++] = 0xf0;
++            payload[plen++] = 0xf0; payload[plen++] = 0x00;
++        }
++        break;
++    }
++
++    default:
++        payload[plen++] = MCTP_CC_UNSUPPORTED_CMD;
++        break;
++    }
++
++    return build_mctp_frame(s, src_eid, dest_eid, tag, payload, plen);
++}
++
++/* -----------------------------------------------------------------------
++ * PLDM Base (Type 0) handler
++ * --------------------------------------------------------------------- */
++
++static uint16_t handle_pldm_base(MCTPEndpointState *s,
++                                 uint8_t dest_eid, uint8_t src_eid,
++                                 uint8_t tag,
++                                 const uint8_t *pldm, uint16_t plen)
++{
++    /*
++     * pldm[0]: Rq(7)|D(6)|instance_id(5:0)
++     * pldm[1]: hdr_ver(7:6)|pldm_type(5:0)
++     * pldm[2]: command
++     * pldm[3+]: data
++     */
++    if (plen < 3) {
++        return 0;
++    }
++
++    uint8_t instance_id = pldm[0] & 0x1f;
++    uint8_t cmd         = pldm[2];
++
++    uint8_t payload[64];
++    uint16_t olen = 0;
++
++    /* MCTP type byte first */
++    payload[olen++] = MCTP_TYPE_PLDM;
++
++    /* PLDM response header */
++    payload[olen++] = instance_id;              /* Rq=0 */
++    payload[olen++] = 0x00;                     /* hdr_ver=0, type=0 */
++    payload[olen++] = cmd;
++
++    switch (cmd) {
++
++    case PLDM_CMD_GET_TID:
++        payload[olen++] = PLDM_CC_SUCCESS;
++        payload[olen++] = s->tid;
++        break;
++
++    case PLDM_CMD_GET_TYPES: {
++        uint8_t types[8] = {0};
++        types[0] |= (1 << 0);       /* bit 0: Type 0 Base */
++        types[0] |= (1 << 2);       /* bit 2: Type 2 PMC */
++        payload[olen++] = PLDM_CC_SUCCESS;
++        memcpy(&payload[olen], types, 8);
++        olen += 8;
++        break;
++    }
++
++    case PLDM_CMD_GET_VER: {
++        /*
++         * Request: TransferOpFlag(1) DataTransferHandle(4) PLDMType(1)
++         * Response: CC(1) NextHandle(4) TransferFlag(1) Version(4)
++         * ver32_t in memory: {alpha, update, minor, major}
++         */
++        if (plen < 7) {
++            payload[olen++] = PLDM_CC_UNSUPPORTED_CMD;
++            break;
++        }
++        uint8_t req_type = pldm[6];
++        payload[olen++] = PLDM_CC_SUCCESS;
++        /* NextDataTransferHandle = 0 */
++        payload[olen++] = 0; payload[olen++] = 0;
++        payload[olen++] = 0; payload[olen++] = 0;
++        /* TransferFlag = 0x05 (Start and End) */
++        payload[olen++] = 0x05;
++        if (req_type == 0x00) {
++            /* PLDM Base v1.1.0: {alpha=0x00, upd=0xF0, minor=0xF1, major=0xF1} */
++            payload[olen++] = 0x00; payload[olen++] = 0xF0;
++            payload[olen++] = 0xF1; payload[olen++] = 0xF1;
++        } else if (req_type == 0x02) {
++            /* PLDM PMC v1.2.0 */
++            payload[olen++] = 0x00; payload[olen++] = 0xF0;
++            payload[olen++] = 0xF2; payload[olen++] = 0xF1;
++        } else {
++            payload[olen - 7] = PLDM_CC_INVALID_TYPE; /* overwrite CC */
++            /* trim back to header+CC */
++            olen = 4 + 1;
++        }
++        break;
++    }
++
++    default:
++        payload[olen++] = PLDM_CC_UNSUPPORTED_CMD;
++        break;
++    }
++
++    return build_mctp_frame(s, src_eid, dest_eid, tag, payload, olen);
++}
++
++/* -----------------------------------------------------------------------
++ * PLDM PMC (Type 2) handler
++ * --------------------------------------------------------------------- */
++
++static uint16_t handle_pldm_pmc(MCTPEndpointState *s,
++                                uint8_t dest_eid, uint8_t src_eid,
++                                uint8_t tag,
++                                const uint8_t *pldm, uint16_t plen)
++{
++    if (plen < 3) {
++        return 0;
++    }
++
++    uint8_t instance_id = pldm[0] & 0x1f;
++    uint8_t cmd         = pldm[2];
++
++    uint8_t payload[MCTP_MAX_PAYLOAD];
++    uint16_t olen = 0;
++
++    payload[olen++] = MCTP_TYPE_PLDM;
++    payload[olen++] = instance_id;
++    payload[olen++] = 0x02;     /* hdr_ver=0, type=2 */
++    payload[olen++] = cmd;
++
++    switch (cmd) {
++
++    case PLDM_CMD_GET_PDR_INFO:
++        /*
++         * Response: CC(1) repo_state(1) update_time(13) oem_update_time(13)
++         *           record_count(4) repo_size(4) largest_record(4)
++         *           xfer_handle_timeout(1)
++         */
++        payload[olen++] = PLDM_CC_SUCCESS;
++        payload[olen++] = 0x00;     /* repo_state = Available */
++        memset(&payload[olen], 0, 13); olen += 13;  /* update_time (zeros) */
++        memset(&payload[olen], 0, 13); olen += 13;  /* oem_update_time */
++        /* record_count (LE32) */
++        payload[olen++] = PDR_COUNT;
++        payload[olen++] = 0; payload[olen++] = 0; payload[olen++] = 0;
++        /* repo_size (LE32) */
++        uint32_t repo_sz = PDR_COUNT * sizeof(PDRNumericRecord);
++        memcpy(&payload[olen], &repo_sz, 4); olen += 4;
++        /* largest_record_size (LE32) */
++        uint32_t rec_sz = sizeof(PDRNumericRecord);
++        memcpy(&payload[olen], &rec_sz, 4); olen += 4;
++        /* data_transfer_handle_timeout */
++        payload[olen++] = 0x00;
++        break;
++
++    case PLDM_CMD_GET_PDR: {
++        /*
++         * Request: record_handle(4) data_transfer_handle(4)
++         *          transfer_op_flag(1) request_count(2) record_change_num(2)
++         * Response: CC(1) next_record_handle(4) next_data_xfer_handle(4)
++         *           transfer_flag(1) resp_count(2) record_data(N) CRC(1)
++         */
++        if (plen < 16) {
++            payload[olen++] = PLDM_CC_UNSUPPORTED_CMD;
++            break;
++        }
++        uint32_t rec_handle;
++        memcpy(&rec_handle, &pldm[3], 4);
++
++        if (rec_handle == 0) {
++            rec_handle = 1;  /* first record */
++        }
++
++        /* Find record index (1-based handle → 0-based index) */
++        int idx = -1;
++        for (uint32_t i = 0; i < PDR_COUNT; i++) {
++            if (pdr_repo[i].hdr.record_handle == rec_handle) {
++                idx = (int)i;
++                break;
++            }
++        }
++        if (idx < 0) {
++            payload[olen++] = 0x82;  /* INVALID_RECORD_HANDLE */
++            break;
++        }
++
++        /* next_record_handle: next record, or 0 if last */
++        uint32_t next_handle = 0;
++        if ((uint32_t)(idx + 1) < PDR_COUNT) {
++            next_handle = pdr_repo[idx + 1].hdr.record_handle;
++        }
++
++        payload[olen++] = PLDM_CC_SUCCESS;
++        memcpy(&payload[olen], &next_handle, 4);        olen += 4;
++        uint32_t zero32 = 0;
++        memcpy(&payload[olen], &zero32, 4);             olen += 4;  /* next_xfer_handle */
++        payload[olen++] = 0x05;                         /* transfer_flag: Start+End */
++        uint16_t data_len = sizeof(PDRNumericRecord);
++        memcpy(&payload[olen], &data_len, 2);           olen += 2;
++        memcpy(&payload[olen], &pdr_repo[idx], data_len); olen += data_len;
++        /* CRC-32 over record data (placeholder – pldmd validates this) */
++        uint32_t crc32_placeholder = 0;
++        memcpy(&payload[olen], &crc32_placeholder, 4);  olen += 4;
++        break;
++    }
++
++    case PLDM_CMD_GET_READING: {
++        /*
++         * Request: sensor_id(2) rearm_event_state(1)
++         * Response: CC(1) sensor_data_size(1) sensor_operational_state(1)
++         *           sensor_event_msg_enable(1) present_state(1) previous_state(1)
++         *           event_state(1) present_reading(N)
++         */
++        if (plen < 6) {
++            payload[olen++] = PLDM_CC_UNSUPPORTED_CMD;
++            break;
++        }
++        uint16_t sensor_id;
++        memcpy(&sensor_id, &pldm[3], 2);
++
++        uint16_t reading;
++        if (sensor_id == SENSOR_ID_TEMP_CPU) {
++            reading = 42;       /* 42°C simulated CPU temperature */
++        } else if (sensor_id == SENSOR_ID_VOLT_12V) {
++            reading = 1198;     /* 11.98V (×0.01) */
++        } else {
++            payload[olen++] = PLDM_CC_INVALID_SENSOR;
++            break;
++        }
++
++        payload[olen++] = PLDM_CC_SUCCESS;
++        payload[olen++] = 0x02;     /* sensor_data_size = uint16 */
++        payload[olen++] = 0x01;     /* operational_state = enabled */
++        payload[olen++] = 0x00;     /* event_msg_enable */
++        payload[olen++] = 0x00;     /* present_state = Normal */
++        payload[olen++] = 0x00;     /* previous_state */
++        payload[olen++] = 0x00;     /* event_state */
++        memcpy(&payload[olen], &reading, 2); olen += 2;
++        break;
++    }
++
++    default:
++        payload[olen++] = PLDM_CC_UNSUPPORTED_CMD;
++        break;
++    }
++
++    return build_mctp_frame(s, src_eid, dest_eid, tag, payload, olen);
++}
++
++/* -----------------------------------------------------------------------
++ * Frame dispatcher
++ * Called after a complete inbound SMBus frame has been received.
++ * Parses DSP0237 header and dispatches to the appropriate handler.
++ * --------------------------------------------------------------------- */
++
++static void process_mctp_frame(MCTPEndpointState *s)
++{
++    uint8_t *frame = s->rx_buf;
++    uint16_t flen  = s->rx_len;
++
++    /*
++     * Minimum frame: byte_count(1) src_addr(1) hdr(1) dst_eid(1)
++     *                src_eid(1) tag(1) type(1) = 7 bytes (+ optional PEC)
++     */
++    if (flen < 7) {
++        qemu_log_mask(LOG_GUEST_ERROR,
++                      "mctp-i2c-endpoint: short frame (%u bytes)\n", flen);
++        return;
++    }
++
++    uint8_t byte_count  = frame[0];
++
++    /* Validate byte_count covers at least our header */
++    if ((uint16_t)byte_count + 1 > flen) {
++        qemu_log_mask(LOG_GUEST_ERROR,
++                      "mctp-i2c-endpoint: byte_count %u > frame len %u\n",
++                      byte_count, flen);
++        return;
++    }
++
++    /* Strip PEC (last byte) from consideration for payload */
++    /* frame[1] = src_slave_addr, frame[2] = flags_hdr_ver */
++    uint8_t dst_eid  = frame[3];
++    uint8_t src_eid  = frame[4];
++    uint8_t tag_fld  = frame[5];
++
++    /* Message starts at frame[6] */
++    const uint8_t *msg     = &frame[6];
++    uint16_t        msg_len = flen - 6 - 1; /* exclude PEC */
++
++    if (msg_len < 1) {
++        return;
++    }
++
++    uint8_t mctp_type = msg[0] & 0x7f;   /* IC bit stripped */
++
++    s->resp_len = 0;
++    s->resp_pos = 0;
++
++    if (mctp_type == MCTP_TYPE_CONTROL) {
++        s->resp_len = handle_mctp_control(s,
++                                          dst_eid, src_eid, tag_fld,
++                                          msg + 1, msg_len - 1);
++    } else if (mctp_type == MCTP_TYPE_PLDM) {
++        if (msg_len < 4) {
++            return;
++        }
++        uint8_t pldm_type = msg[2] & 0x3f;  /* strip hdr_ver */
++        if (pldm_type == 0x00) {
++            s->resp_len = handle_pldm_base(s,
++                                           dst_eid, src_eid, tag_fld,
++                                           msg + 1, msg_len - 1);
++        } else if (pldm_type == 0x02) {
++            s->resp_len = handle_pldm_pmc(s,
++                                          dst_eid, src_eid, tag_fld,
++                                          msg + 1, msg_len - 1);
++        }
++    }
++}
++
++/* -----------------------------------------------------------------------
++ * Bottom-half: push response bytes into Aspeed I2C slave DMA
++ *
++ * The BH does an async master-write to BMC_I2C_SLAVE_ADDR so that the
++ * Aspeed I2C DMA slave path (I2C_START_SEND_ASYNC / send_async) fires
++ * the kernel's mctp-i2c receive ISR.
++ * --------------------------------------------------------------------- */
++
++static void mctp_i2c_resp_bh(void *opaque)
++{
++    MCTPEndpointState *s = opaque;
++
++    if (!s->resp_len) {
++        return;
++    }
++
++    /* Initiate async master write to BMC slave address */
++    if (i2c_start_send_async(s->bus_ref, BMC_I2C_SLAVE_ADDR) != 0) {
++        qemu_log_mask(LOG_GUEST_ERROR,
++                      "mctp-i2c-endpoint: could not start async send to "
++                      "BMC slave 0x%02x\n", BMC_I2C_SLAVE_ADDR);
++        return;
++    }
++
++    for (uint16_t i = 0; i < s->resp_len; i++) {
++        i2c_send_async(s->bus_ref, s->resp_buf[i]);
++    }
++
++    i2c_end_transfer(s->bus_ref);
++
++    s->resp_len = 0;
++    s->resp_pos = 0;
++}
++
++/* -----------------------------------------------------------------------
++ * I2C slave callbacks
++ * --------------------------------------------------------------------- */
++
++/* Master sends a byte to us (master→slave direction) */
++static int mctp_i2c_ep_send(I2CSlave *i2c, uint8_t data)
++{
++    MCTPEndpointState *s = MCTP_I2C_ENDPOINT(i2c);
++
++    if (s->rx_len < MCTP_MAX_I2C_FRAME) {
++        s->rx_buf[s->rx_len++] = data;
++    } else {
++        qemu_log_mask(LOG_GUEST_ERROR,
++                      "mctp-i2c-endpoint: RX overflow, discarding byte\n");
++    }
++    return 0; /* ACK */
++}
++
++/* Bus event: START_SEND, FINISH, NACK */
++static int mctp_i2c_ep_event(I2CSlave *i2c, enum i2c_event event)
++{
++    MCTPEndpointState *s = MCTP_I2C_ENDPOINT(i2c);
++
++    switch (event) {
++    case I2C_START_SEND:
++    case I2C_START_SEND_ASYNC:
++        s->rx_len = 0;
++        break;
++
++    case I2C_FINISH:
++        /* Frame complete – process and schedule response */
++        process_mctp_frame(s);
++        if (s->resp_len > 0) {
++            qemu_bh_schedule(s->bh);
++        }
++        s->rx_len = 0;
++        break;
++
++    case I2C_NACK:
++        s->rx_len = 0;
++        break;
++
++    default:
++        break;
++    }
++    return 0;
++}
++
++/* -----------------------------------------------------------------------
++ * QOM realize / unrealize
++ * --------------------------------------------------------------------- */
++
++static void mctp_i2c_ep_realize(DeviceState *dev, Error **errp)
++{
++    MCTPEndpointState *s = MCTP_I2C_ENDPOINT(dev);
++
++    s->eid = 0;     /* unassigned until mctpd SetEndpointID */
++    s->tid = SIMULATED_TID;
++    s->rx_len  = 0;
++    s->resp_len = 0;
++    s->resp_pos = 0;
++
++    /* Obtain a pointer to our parent I2C bus for the response BH */
++    s->bus_ref = I2C_BUS(qdev_get_parent_bus(dev));
++
++    s->bh = qemu_bh_new(mctp_i2c_resp_bh, s);
++}
++
++static void mctp_i2c_ep_unrealize(DeviceState *dev)
++{
++    MCTPEndpointState *s = MCTP_I2C_ENDPOINT(dev);
++    qemu_bh_delete(s->bh);
++}
++
++/* -----------------------------------------------------------------------
++ * QOM class init + type registration
++ * --------------------------------------------------------------------- */
++
++static void mctp_i2c_ep_class_init(ObjectClass *klass, const void *data)
++{
++    DeviceClass *dc    = DEVICE_CLASS(klass);
++    I2CSlaveClass *sc  = I2C_SLAVE_CLASS(klass);
++
++    dc->desc      = "MCTP-over-SMBus/I2C endpoint (PLDM PMC simulation)";
++    dc->realize   = mctp_i2c_ep_realize;
++    dc->unrealize = mctp_i2c_ep_unrealize;
++
++    sc->send  = mctp_i2c_ep_send;
++    sc->event = mctp_i2c_ep_event;
++    /* recv not needed – this device never responds to I2C master-read */
++}
++
++static const TypeInfo mctp_i2c_endpoint_info = {
++    .name          = TYPE_MCTP_I2C_ENDPOINT,
++    .parent        = TYPE_I2C_SLAVE,
++    .instance_size = sizeof(MCTPEndpointState),
++    .class_init    = mctp_i2c_ep_class_init,
++};
++
++static void mctp_i2c_endpoint_register_types(void)
++{
++    type_register_static(&mctp_i2c_endpoint_info);
++}
++
++type_init(mctp_i2c_endpoint_register_types)

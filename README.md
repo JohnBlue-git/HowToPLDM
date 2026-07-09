@@ -2,13 +2,49 @@
 
 ## Project Structure
 
-The `meta-johnblue` layer is organized as follows:
-
-- **conf/**: Layer configuration files.
-- **meta-common/**: Common metadata shared across platforms.
-- **meta-daytonax/**, **meta-ethanolx/**: Platform-specific metadata.
-- **recipes-phosphor/**: Recipes for OpenBMC phosphor components, including PLDM terminus.
-- **Other directories**: Support for additional platforms and features.
+```
+meta-johnblue/
+├── conf/
+│   ├── layer.conf                          # Layer metadata, priorities, dependencies
+│   ├── machine/
+│   │   └── johnblue.conf                   # Machine definition (AST2600, QB_MACHINE override)
+│   └── templates/default/
+│       ├── bblayers.conf.sample            # Ready-to-use bblayers configuration
+│       └── local.conf.sample               # Ready-to-use local.conf with MACHINE=johnblue
+├── recipes-devtools/
+│   └── qemu/
+│       ├── files/
+│       │   ├── 0001-hw-i2c-add-mctp-i2c-endpoint-device.patch
+│       │   │   # Standalone draft patch — mctp_i2c_endpoint.c only (reference, not used by build)
+│       │   └── 0001-hw-add-mctp-i2c-endpoint-and-ast2600-johnblue-machine.patch
+│       │       # Comprehensive Yocto patch — all QEMU changes (used by bbappend)
+│       └── qemu-system-native_%.bbappend   # Injects the QEMU patch into qemu-system-native build
+├── recipes-kernel/
+│   └── linux/
+│       ├── files/
+│       │   └── i2c-slave-dev.cfg           # Kernel config fragment: I2C slave support
+│       ├── linux-aspeed_%.bbappend         # Applies DTS patch (mctp-controller on i2c1)
+│       └── linux-yocto-fitimage.bbappend
+├── recipes-phosphor/
+│   ├── images/
+│   │   └── obmc-phosphor-image.bbappend    # Adds pldm-terminus to image
+│   ├── mctp/
+│   │   ├── files/
+│   │   │   ├── mctpd.conf                  # bus-owner mode, 5s timeout
+│   │   │   └── mctp-setup-i2c.service      # Brings up mctpi2c1, adds BMC EID 8
+│   │   └── mctp_%.bbappend
+│   ├── pldm/
+│   │   ├── files/host_eid                  # EID 10 — the QEMU endpoint's assigned EID
+│   │   └── pldm_%.bbappend
+│   └── pldm-terminus/
+│       ├── files/
+│       │   ├── pldm-terminus.c             # Loopback-only mock (superseded; kept for reference)
+│       │   ├── pldm-terminus.service
+│       │   └── mctp-lo-setup.service
+│       └── pldm-terminus_1.0.bb
+└── manifest/
+    └── main.xml
+```
 
 This structure enables modular development and easy integration with the OpenBMC build system.
 
@@ -58,19 +94,21 @@ If you use `repo init -u https://github.com/openbmc/openbmc.git`, that only work
 
 ## Design Flow Introduction
 
-The data flow in this project typically follows these steps:
-
-1. **Sensor (or Terminus)**: Hardware sensors or terminus devices collect data or events.
-2. **MCTP (Management Component Transport Protocol)**: Sensors communicate with the BMC using MCTP, a transport protocol for platform management.
-3. **PLDM (Platform Level Data Model)**: Data is encapsulated in PLDM messages, which standardize platform management and monitoring.
-
-**Flow Diagram:**
+The data flow in this project follows the full real-hardware path through the kernel's MCTP-over-I2C driver stack:
 
 ```
-Sensor/Terminus → MCTP → PLDM → BMC/OpenBMC Services
+QEMU I2C device (mctp-i2c-endpoint @ bus1/0x0f)
+        ↓  DSP0237 MCTP-over-SMBus frames over virtual I2C
+Kernel: aspeed_i2c → mctp-i2c master driver → AF_MCTP socket
+        ↓
+mctpd (bus owner, EID discovery via SetEndpointID)
+        ↓
+pldmd / platform-mc (PLDM PDR walk, GetSensorReading polling)
+        ↓
+OpenBMC D-Bus / Redfish sensor objects
 ```
 
-This design allows for scalable, interoperable platform management using industry standards.
+This exercises the **complete real kernel driver path** — `aspeed_i2c.c`, `mctp-i2c.c`, `mctpd`, and `pldmd` — using a QEMU I2C device model that speaks the same wire protocol as real PLDM terminus hardware.
 
 ## What are MCTP and PLDM?
 
@@ -80,175 +118,213 @@ This design allows for scalable, interoperable platform management using industr
 
 ## MCTP / PLDM Device and Service Relationship
 
-The current mock stack is designed to make the PLDM services runnable in QEMU by using a local MCTP transport and a mock terminus device.
+With the QEMU I2C device model, the full service chain exercises the real kernel MCTP-over-I2C driver path.
 
+- **QEMU I2C device** (`mctp-i2c-endpoint` at bus 1 / address `0x0f`)
+  - Handles all MCTP framing (DSP0237), MCTP Control (DSP0236), and PLDM protocols
+  - Visible to the Linux kernel as a real I2C slave via the `aspeed_i2c` virtual bus
 - **BMC side (EID 8)**
-  - `mctpd`: MCTP bus owner daemon
-  - `mctp-setup-i2c.service`: manually probes the MCTP I2C adapter and brings up `mctpi2c1`
-  - `mctp-lo-setup.service`: adds MCTP addresses for EID 10 first, then EID 8
+  - `mctpd`: MCTP bus owner daemon — performs EID discovery (SetEndpointID → assigns EID 10 to the QEMU device)
+  - `mctp-setup-i2c.service`: brings up `mctpi2c1` (created automatically by the kernel `mctp-i2c` driver when the DTS `mctp-controller` property is present), adds BMC EID 8
   - `pldmd.service`: PLDM daemon on the BMC
-- **Terminus side (EID 10)**
-  - `pldm-terminus.service`: mock PLDM terminus responder bound to AF_MCTP EID 10
+- **Terminus side (EID 10)** — the QEMU I2C device model
+  - EID is assigned by `mctpd` at runtime via `SetEndpointID` (no static `mctp addr add` needed for terminus)
+  - Responds to all PLDM Base (Type 0) and PLDM PMC (Type 2) commands
+  - `pldm-terminus.service` (loopback mock) is still installed but no longer drives the I2C sensor path
 
 **Service startup chain:**
 
 ```
 mctpd
-  └─ mctp-setup-i2c.service  # create mctpi2c1 and bring it up
-       └─ mctp-lo-setup.service  # add EID 10 then EID 8 on mctpi2c1
-             ├─ pldm-terminus.service  # mock terminus at EID 10
-             └─ pldmd.service  # BMC PLDM daemon at EID 8
+  └─ mctp-setup-i2c.service   # brings up mctpi2c1, adds BMC EID 8
+       └─ pldmd.service        # BMC PLDM daemon; mctpd discovers QEMU device as EID 10
 ```
 
 **Service relation diagram:**
 
 ```
-[ mctpd ]
+[ mctpd ]   ←──── discovers QEMU I2C device, assigns EID 10
     |
     v
-[ mctp-setup-i2c.service ]
+[ mctp-setup-i2c.service ]   ←── mctpi2c1 up, BMC EID 8
     |
     v
-[ mctp-lo-setup.service ]
-   /                     \
-  v                       v
-[pldm-terminus.service] [pldmd.service]
+[ pldmd.service ]            ←── queries QEMU device: GetPDR, GetSensorReading
 ```
 
-- `mctpd` provides the base MCTP transport.
-- `mctp-setup-i2c.service` creates the `mctpi2c1` transport device.
-- `mctp-lo-setup.service` adds MCTP endpoint addresses for EID 10 and EID 8.
-- `pldm-terminus.service` is the mock PLDM responder at EID 10.
-- `pldmd.service` is the BMC-side PLDM daemon at EID 8.
-
-The key runtime fix is the ordered service startup: `mctp-setup-i2c.service` must create the transport first, then `mctp-lo-setup.service` adds the addresses in the correct order so loopback replies from the mock terminus can be matched by `pldmd`.
+- `mctpd` performs real EID assignment via the `mctp-i2c` kernel driver.
+- `mctp-setup-i2c.service` creates the `mctpi2c1` network device (via kernel DT `mctp-controller` property on `&i2c1`) and adds BMC EID 8.
+- `pldmd.service` (platform-mc component) walks the PDR repository and polls `GetSensorReading`.
+- The QEMU I2C device model at `bus1/0x0f` handles all terminus-side PLDM logic.
 
 ---
 
-## ⚠️ Important: MOCKING IMPLEMENTATION FOR TESTING ONLY
+## Implementation Status: QEMU Device Model
 
-**This meta-johnblue layer contains a PURE MOCKING implementation of MCTP and PLDM services. It is designed for QEMU testing and demonstration purposes only, NOT for production use or real hardware integration.**
+This layer uses a QEMU I2C device model as the PLDM terminus. This is **not a pure software loopback mock** — it exercises the real kernel MCTP-over-I2C driver path while the terminus logic runs inside QEMU's device model infrastructure.
 
-### Mocking Components Overview
+### What is real
 
-#### 1. **PLDM Terminus Mock** (`recipes-phosphor/pldm-terminus/`)
-The `pldm-terminus` is a minimal mock PLDM responder that simulates a remote terminus device. **It is entirely non-functional in terms of real platform management:**
+- **`aspeed_i2c` driver**: the QEMU AST2600 I2C master emulation is the real upstream code
+- **`mctp-i2c` kernel driver**: the Linux kernel's `drivers/net/mctp/mctp-i2c.c` handles all framing
+- **`mctpd` EID assignment**: `SetEndpointID` flows over the real I2C path, not a static `mctp addr add`
+- **`pldmd` PDR walk and polling**: `pldmd`'s `platform-mc` component performs a real PDR repository walk and calls `GetSensorReading` periodically
 
-- **Location**: `pldm-terminus.c` - A 200-line mock responder program
-- **Binding**: Binds to **MCTP loopback interface** (`lo`), NOT real hardware
-- **EID**: Runs on EID 10 (mock terminus)
-- **Functionality**: Only responds to **3 PLDM base discovery commands**:
-  - `GetTID` → Returns hard-coded TID = 1
-  - `GetPLDMTypes` → Returns hard-coded type bitmap (only base type supported)
-  - `GetPLDMVersion` → Returns hard-coded version 1.1.0
-- **What it does NOT do**:
-  - Does NOT read any sensors or platform data
-  - Does NOT provide any real commands (only discovery)
-  - Does NOT interface with actual hardware drivers
-  - Does NOT send or receive real platform management data
-  - Responses are entirely hard-coded with no dynamic content
+### What is simulated
 
-**Service**: `pldm-terminus.service`
-- Type: `simple` (runs as a background daemon)
-- Bound to: `mctp-lo-setup.service` (loopback setup)
-- Restart: On failure with 2-second delay
-- When running, it simply listens on loopback and echoes hard-coded responses to pldmd requests
+- **Sensor values**: CPU temp is statically 42 °C, 12V rail is statically 11.98 V — there is no actual hwmon driver behind these
+- **`pldm-terminus.service`**: the loopback-based userspace mock is still installed but is superseded by the I2C device model for actual I2C PLDM traffic
 
-#### 2. **MCTP Transport Mock** (`recipes-phosphor/mctp/`)
-The MCTP layer is configured for loopback testing only:
+### Data flow
 
-- **mctpd.conf**: Sets BMC as "bus-owner" with basic timeout configuration
-  - No real MCTP message processing
-  - Just configuration parameters
-- **mctp-setup-i2c.service**: 
-  - Attempts to create `mctpi2c1` network interface (fails silently in pure QEMU without kernel module)
-  - Falls back to loopback interface
-  - Only sets up interface addresses: BMC EID=8 on loopback
-  - Does NOT communicate with real I2C hardware drivers
-  - Does NOT handle real sensor communication
-
-#### 3. **MCTP Loopback Setup** (`mctp-lo-setup.service`)
-- Adds mock addresses to loopback interface only:
-  - BMC EID 8 on `lo`
-  - Terminus EID 10 on `lo`
-  - Static neighbor route to EID 10 via loopback (all traffic is local)
-- **This is purely virtual routing for testing**, not connected to any real transport
-- The service order is important: `mctp-setup-i2c.service` creates the transport first, then `mctp-lo-setup.service` adds MCTP addresses so `pldm-terminus` can bind correctly before `pldmd` starts.
-
-### Why This Mocking Design?
-
-This approach allows you to:
-1. **Test PLDM discovery flow** without real hardware
-2. **Verify pldmd startup** and PLDM client connectivity in QEMU
-3. **Develop and debug** PLDM applications without hardware dependencies
-4. **Demonstrate** the MCTP/PLDM stack architecture
-
-### Data Flow (Mocking vs Real)
-
-**Current Mocking Flow:**
 ```
-pldmd (on BMC EID 8)
+pldmd / platform-mc (BMC EID 8)
+    ↓  AF_MCTP socket → mctp-i2c.c → aspeed_i2c.c
+    ↓  I2C master write (DSP0237 MCTP-over-SMBus frame)
+mctp-i2c-endpoint QEMU device (bus1/addr 0x0f, EID 10)
+    ↓  processes frame, builds response
+    ↓  i2c_start_send_async → Aspeed DMA slave ISR
+mctp-i2c.c → AF_MCTP → pldmd
     ↓
-    [sends PLDM discovery request via loopback]
-    ↓
-pldm-terminus (on loopback EID 10)
-    ↓
-    [returns hard-coded discovery response]
-    ↓
-pldmd (receives response, marks discovery complete)
-
-❌ NO REAL SENSOR DATA
-❌ NO REAL PLATFORM MANAGEMENT COMMANDS
-❌ NO HARDWARE DRIVER PARTICIPATION
+D-Bus sensor objects / Redfish
 ```
 
-**Future Production Flow (NOT implemented here):**
+---
+
+## QEMU I2C Device Model
+
+The core of this layer is a custom QEMU I2C slave device (`mctp-i2c-endpoint`) that replaces the AF_MCTP loopback mock with a proper in-QEMU terminus that exercises the real Linux kernel driver path.
+
+### Architecture
+
 ```
-Real Sensors/Platform Hardware
-    ↓
-    [MCTP over real I2C / Ethernet transport]
-    ↓
-Real PLDM Terminus (with actual sensor polling)
-    ↓
-    [Real PLDM commands: GetSensorReading, GetEventMessages, etc.]
-    ↓
-pldmd (processes real platform data)
-    ↓
-OpenBMC Services (logging, monitoring, etc.)
+QEMU userspace
+  ┌──────────────────────────────────────────────────────────┐
+  │  aspeed_i2c master (I2C bus 1)                           │
+  │       ↕  I2C master writes/slave reads (QEMU I2C API)   │
+  │  mctp-i2c-endpoint (addr 0x0f)                           │
+  │       - DSP0237 MCTP-over-SMBus framing + PEC CRC-8      │
+  │       - MCTP Control (DSP0236): SetEID/GetEID             │
+  │       - PLDM Base (DSP0240, Type 0)                      │
+  │       - PLDM PMC (DSP0248, Type 2) + static PDR repo     │
+  └──────────────────────────────────────────────────────────┘
+         ↕  virtual I2C
+  ┌──────────────────────────────────────────────────────────┐
+  │  Linux kernel (in QEMU guest)                            │
+  │       aspeed_i2c.c  →  mctp-i2c.c  →  AF_MCTP socket   │
+  │       mctpd (EID discovery, SetEndpointID)               │
+  │       pldmd / platform-mc (PDR walk, GetSensorReading)   │
+  └──────────────────────────────────────────────────────────┘
 ```
 
-### Transitioning from Mock to Real Hardware
+### Device Details
 
-To adapt this layer for real hardware:
+| Property | Value |
+|---|---|
+| QEMU type name | `mctp-i2c-endpoint` |
+| I2C bus | bus 1 (`mctpi2c1` in kernel) |
+| I2C address | `0x0f` (7-bit) |
+| Machine name | `ast2600-johnblue` |
+| Source file | `hw/i2c/mctp_i2c_endpoint.c` |
+| Header file | `include/hw/i2c/mctp_i2c_endpoint.h` |
 
-1. **Replace pldm-terminus**: Instead of mocking responses, implement a real terminus that:
-   - Polls actual sensors via hardware drivers
-   - Implements full PLDM platform/sensor/event management commands
-   - Handles real I2C/Ethernet MCTP transport
+### Protocol Support
 
-2. **Enable real MCTP transport**: Configure MCTP over actual I2C bus (e.g., i2c-1)
-   - Enable `CONFIG_MCTP_TRANSPORT_I2C` in kernel
-   - Modify `mctp-setup-i2c.service` to use real hardware adapters
-   - Remove loopback-only services
+| Protocol | Spec | Commands |
+|---|---|---|
+| MCTP-over-SMBus framing | DSP0237 | Full frame encode/decode, PEC CRC-8 |
+| MCTP Control | DSP0236 | `SetEndpointID`, `GetEndpointID`, `GetMCTPVersionSupport`, `GetMessageTypeSupport` |
+| PLDM Base | DSP0240 Type 0 | `GetTID`, `GetPLDMTypes`, `GetPLDMVersion` |
+| PLDM PMC | DSP0248 Type 2 | `GetPDRRepositoryInfo`, `GetPDR`, `GetSensorReading` |
 
-3. **Sensor integration**: Connect the terminus to real sensor driver interfaces
-   - Implement hwmon driver integration
-   - Add real PLDM command handlers for sensor/event data
+### Simulated Sensors
 
-### Testing Limitations
+| Sensor ID | Description | Type | Unit | Simulated Value |
+|---|---|---|---|---|
+| `0x0001` | CPU Temperature | `NumericSensorPDR` | °C (base_unit=2) | 42 °C |
+| `0x0002` | 12V Rail Voltage | `NumericSensorPDR` | V (base_unit=5, unitModifier=-2) | 11.98 V (reading=1198) |
 
-Due to the mocking nature, **do NOT expect**:
-- Real sensor readings from pldmd/pldmtool
-- Real platform management capabilities
-- Event logging from hardware
-- System state monitoring
-- Any actual interaction with platform hardware
+### Response Mechanism (Aspeed AST2600 New-Mode I2C)
 
-This is a **demonstration and testing framework only**.
+The AST2600 uses the "new mode" DMA slave path for I2C. When the QEMU device receives an MCTP frame (`I2C_FINISH` event), it:
+
+1. Parses the DSP0237 frame in `process_mctp_frame()`
+2. Dispatches to the appropriate handler (`handle_mctp_control`, `handle_pldm_base`, `handle_pldm_pmc`)
+3. Builds the response frame (prepends DSP0237 header, appends PEC CRC-8)
+4. Schedules a QEMU bottom half (`qemu_bh_schedule`)
+5. In the BH callback: calls `i2c_start_send_async(bus, BMC_I2C_SLAVE_ADDR=0x10)` then `i2c_send_async()` per byte
+
+This correctly triggers the Aspeed DMA slave ISR on the kernel side, making `mctp-i2c` see a properly-framed response.
+
+### QEMU Machine: `ast2600-johnblue`
+
+`aspeed_ast2600_johnblue.c` defines a new QEMU machine that clones `ast2600-evb` and adds the MCTP endpoint:
+
+```c
+// Places mctp-i2c-endpoint at I2C bus 1 / address 0x0f
+i2c_slave_create_simple(aspeed_i2c_get_bus(&soc->i2c, 1),
+                        TYPE_MCTP_I2C_ENDPOINT, 0x0f);
+```
+
+`johnblue.conf` overrides the inherited QEMU machine:
+
+```bitbake
+QB_MACHINE = "-machine ast2600-johnblue"
+```
+
+---
+
+## QEMU Patch Files
+
+### `0001-hw-add-mctp-i2c-endpoint-and-ast2600-johnblue-machine.patch`
+
+This is the **active patch** applied by `qemu-system-native_%.bbappend`. It covers all 7 files needed to integrate the device model into QEMU 10.2.0:
+
+| File | Type | Description |
+|---|---|---|
+| `hw/i2c/mctp_i2c_endpoint.c` | new | Core device model (~855 lines): DSP0237 framing, MCTP Control, PLDM Base, PLDM PMC, 2 sensors, BH response path |
+| `include/hw/i2c/mctp_i2c_endpoint.h` | new | `MCTPEndpointState` struct, `TYPE_MCTP_I2C_ENDPOINT` constant |
+| `hw/arm/aspeed_ast2600_johnblue.c` | new | Machine `"ast2600-johnblue"`: clones EVB, places `mctp-i2c-endpoint` on bus 1 / addr `0x0f` |
+| `hw/i2c/Kconfig` | modified | Adds `config MCTP_I2C_ENDPOINT` (bool, selects I2C) |
+| `hw/i2c/meson.build` | modified | Conditionally compiles `mctp_i2c_endpoint.c` under `CONFIG_MCTP_I2C_ENDPOINT` |
+| `hw/arm/Kconfig` | modified | Adds `select MCTP_I2C_ENDPOINT` to `config ASPEED_SOC` |
+| `hw/arm/meson.build` | modified | Adds `aspeed_ast2600_johnblue.c` to the aspeed machine list |
+
+The patch is in standard `git format-patch` format with unified diffs. New files use `/dev/null` as the `a/` side.
+
+Key implementation notes:
+- `qemu/main-loop.h` must be included explicitly for `qemu_bh_new` / `qemu_bh_schedule` / `qemu_bh_delete` — these are not pulled in by `qemu/osdep.h`
+- The response is sent as a master-write to `BMC_I2C_SLAVE_ADDR=0x10` (not as a slave-read), matching the Aspeed DMA slave ISR path
+
+### `0001-hw-i2c-add-mctp-i2c-endpoint-device.patch`
+
+This is a **standalone draft** of `mctp_i2c_endpoint.c` only (~857 lines). It was generated during an early iteration before the Kconfig, meson.build, machine file, and header were finalized.
+
+- Contains only the device `.c` file (no Kconfig, no meson.build changes, no machine file, no header)
+- Missing the `#include "qemu/main-loop.h"` line (would fail to compile as-is)
+- **NOT referenced by the bbappend** — kept as a reference artifact
+
+For actual Yocto builds, only the comprehensive patch above is used.
+
+---
 
 ## Build and Run with QEMU
 
 Follow these steps to build the OpenBMC image with the meta-johnblue layer and run it in QEMU.
+
+### 0. Rebuild qemu-system-native first
+
+Because `meta-johnblue` patches QEMU source, you must rebuild `qemu-system-native` before (or as part of) the image build. If your `sstate-cache` has a pre-patch binary, force a rebuild:
+
+```bash
+bitbake -c cleanall qemu-system-native && bitbake qemu-system-native
+```
+
+Then build the full image:
+
+```bash
+bitbake obmc-phosphor-image
+```
 
 ### 1. Setup johnblue Layer
 
@@ -312,7 +388,7 @@ From the OpenBMC root directory, set up the build environment and build the firm
 
 ```bash
 # Initialize build environment (if not already done)
-source setup
+. setup johnblue
 
 # Build the phosphor image with the meta-johnblue layer
 bitbake obmc-phosphor-image
@@ -342,13 +418,6 @@ Once the build completes, run QEMU with the built image:
 ```bash
 # From the OpenBMC build directory
 runqemu johnblue slirp nographic
-```
-
-Or with more control:
-
-```bash
-# Specify the machine and build directory explicitly
-runqemu build/tmp/deploy/images/johnblue/ johnblue slirp nographic
 ```
 
 **QEMU Options** (optional - runqemu handles defaults):
@@ -386,20 +455,24 @@ ssh root@192.168.7.2
 
 ### 5. Verify Services in QEMU
 
-Once logged into the QEMU BMC, verify the mocking services are running:
+Once logged into the QEMU BMC, do a quick sanity check:
 
 ```bash
-# Check MCTP loopback setup
-mctp addr show
-# Expected: EID 8 (BMC) and 10 (mock terminus) on device "lo"
+# Verify the MCTP I2C interface came up (created by mctp-i2c kernel driver)
+mctp link show
+# Expected: mctpi2c1 listed as UP
 
-# Check PLDM terminus mock
-systemctl status pldm-terminus.service
-systemctl status pldmd.service
+mctp addr show
+# Expected: EID 8 (BMC) on mctpi2c1
+
+mctp neigh show
+# Expected: EID 10 (QEMU terminus) reachable via mctpi2c1
+
+# Check services
+systemctl status mctpd.service mctp-setup-i2c.service pldmd.service
 
 # View logs
-journalctl -u pldm-terminus.service -n 20
-journalctl -u pldmd.service -n 20
+journalctl -u pldmd.service -n 30
 ```
 
 ### 6. Exit QEMU
@@ -445,127 +518,87 @@ runqemu qemuarm johnblue nographic
 
 ## How to Verify
 
-⚠️ **IMPORTANT**: Due to the mocking design, these verification steps test the PLDM discovery and loopback stack only, NOT real platform management or sensor data.
+After `runqemu johnblue slirp nographic` boots to the login prompt, log in as `root` and run the following checks.
 
-To verify the functionality of the `meta-johnblue` layer and its PLDM terminus mock implementation:
-
-### Build and Deploy
-1. **Build the Image**
-   - Set up the OpenBMC build environment.
-   - Add `meta-johnblue` to your `bblayers.conf`.
-   - Run `bitbake <image-name>` to build the firmware image.
-
-2. **Deploy and Boot**
-   - Flash the built image to your target hardware or use QEMU for emulation.
-   - Boot the system and access the BMC console.
-
-### Verify Mock Services Are Running
-3. **Check PLDM Terminus Mock**
-   - Verify that the PLDM terminus mock service is running:
-     ```bash
-     systemctl status pldm-terminus.service
-     ```
-   - Check logs to confirm it bound to loopback EID 10:
-     ```bash
-     journalctl -u pldm-terminus.service -n 20
-     # Expected output: "pldm-terminus: bound to EID 10, type PLDM"
-     ```
-
-4. **Verify MCTP Setup**
-   - Check both setup services:
-     ```bash
-     systemctl status mctp-setup-i2c.service
-     systemctl status mctp-lo-setup.service
-     ```
-   - Verify loopback addresses were added:
-     ```bash
-     mctp addr show
-     # Expected: EID 8 on lo, EID 10 on lo
-     mctp neigh show
-     # Expected: EID 10 reachable via loopback
-     ```
-
-### Verify Discovery Flow (Mock Stack)
-5. **Check pldmd Discovery Completes**
-   - Verify pldmd is running and connected:
-     ```bash
-     busctl status xyz.openbmc_project.PLDM
-     systemctl status pldmd.service
-     ```
-   - Check pldmd logs for discovery completion:
-     ```bash
-     journalctl -u pldmd.service -n 50 | grep -i "discover\|tid\|type"
-     ```
-   - Expected behavior: pldmd discovers the mock terminus and completes initialization
-   - **Expected limitation**: Discovery may show mock EID 10 but NO real sensor data
-
-### What NOT to Expect (Mock Limitations)
-6. **⚠️ Mock Testing Limitations**
-   - **No sensor data**: pldmtool will NOT show any real sensors
-     ```bash
-     pldmtool platform GetStateSensorReadings
-     # Will likely return empty or error (mock doesn't implement sensor commands)
-     ```
-   - **No I2C device communication**: In pure QEMU, `mctpi2c1` interface will NOT be created (no real mctp-i2c driver)
-   - **Loopback only**: All MCTP traffic is on `lo`, not real hardware
-   - **Discovery only**: The mock terminus only responds to discovery commands
-   - **Hard-coded responses**: No dynamic data from the mock
-
-### Detailed Verification in QEMU (Mock Environment)
-
-After `runqemu` boots, inside the BMC shell:
+### 1. Verify MCTP I2C transport is up
 
 ```bash
-# 1. Verify MCTP loopback stack is up
+# mctpi2c1 is created by the kernel mctp-i2c driver via the DTS mctp-controller property
+mctp link show
+# Expected: mctpi2c1 is listed as UP
+
 mctp addr show
-# Expected: 8 (BMC) and 10 (mock terminus) on device "lo"
-
-# 2. Verify neighbor routing for mock terminus
-mctp neigh show
-# Expected: 10 dev lo with all-zeros lladdr
-
-# 3. Check pldm-terminus process is running
-ps aux | grep pldm-terminus
-systemctl status pldm-terminus.service
-# Expected: /usr/bin/pldm-terminus running
-
-# 4. Verify pldmd bound to BMC EID 8
-busctl status xyz.openbmc_project.PLDM
-systemctl status pldmd.service
-
-# 5. Test pldmtool discovery (will work via mock)
-pldmtool base GetTID -m 10
-# Expected: Returns TID=1 (mock response)
-
-pldmtool base GetPLDMTypes -m 10
-# Expected: Returns types bitmap showing only base type (mock response)
-
-pldmtool base GetPLDMVersion -m 10 -t 0
-# Expected: Returns version 1.1.0 (mock response) (-t 0 = PLDM base type)
-
-# 6. ❌ Do NOT expect real sensor data
-pldmtool platform GetSensorReadings
-# Will likely error or return empty (not implemented in mock)
+# Expected: EID 8 (BMC) on mctpi2c1
 ```
 
-### If Issues Occur
+### 2. Verify mctpd discovered the QEMU endpoint
 
-**If mctpi2c1 doesn't appear:**
-- This is expected in pure QEMU if `mctp-i2c` driver isn't available
-- Loopback interface `lo` is used instead for testing
-- This is normal for the mocking environment
-
-**If pldm-terminus fails to bind:**
 ```bash
-journalctl -u pldm-terminus.service
-# Check for AF_MCTP socket errors
-dmesg | grep -i mctp
+mctp neigh show
+# Expected: EID 10 reachable via mctpi2c1 (assigned by mctpd SetEndpointID)
+
+journalctl -u mctpd.service -n 30 | grep -i "eid\|endpoint\|assign"
+```
+
+### 3. Test PLDM Base commands (Type 0)
+
+```bash
+pldmtool base GetTID -m 10
+# Expected: TID = 1
+
+pldmtool base GetPLDMTypes -m 10
+# Expected: Supported types include Type 0 (Base) and Type 2 (Platform Monitoring)
+
+pldmtool base GetPLDMVersion -m 10 -t 0
+# Expected: PLDM Base version 1.1.0
+```
+
+### 4. Test PLDM PMC commands (Type 2) — sensors
+
+```bash
+# Walk the PDR repository
+pldmtool platform GetPDRRepositoryInfo -m 10
+# Expected: 2 records in repo
+
+pldmtool platform GetPDR -m 10 --record-handle 0
+# Expected: First NumericSensorPDR (CPU temp, sensor ID 1, unit °C)
+
+# Read sensor values
+pldmtool platform GetSensorReading -m 10 --sensor-id 1
+# Expected: sensorDataSize=1, presentReading=42 (CPU temp 42°C)
+
+pldmtool platform GetSensorReading -m 10 --sensor-id 2
+# Expected: presentReading=1198, unitModifier=-2 → 11.98 V (12V rail)
+```
+
+### 5. Verify pldmd service is running
+
+```bash
+systemctl status pldmd.service
+busctl status xyz.openbmc_project.PLDM
+journalctl -u pldmd.service -n 50 | grep -i "sensor\|pdr\|discover"
+```
+
+### Troubleshooting
+
+**If `mctpi2c1` does not appear:**
+
+```bash
+dmesg | grep -i "mctp\|i2c"
+# Check the DTS patch was applied: &i2c1 should have mctp-controller property
+cat /proc/device-tree/ahb/apb/i2c@1e78a080/mctp-controller 2>/dev/null && echo present
+```
+
+**If mctpd does not assign EID 10:**
+```bash
+journalctl -u mctpd.service | tail -30
+# Verify mctpd.conf: mode = "bus-owner"
 ```
 
 **If pldmd discovery fails:**
 ```bash
 journalctl -u pldmd.service | tail -50
-systemctl status mctpd.service
+systemctl status mctpd.service mctp-setup-i2c.service
 ```
 
 ---

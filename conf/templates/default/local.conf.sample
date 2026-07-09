@@ -66,5 +66,3 @@ BB_GIT_SHALLOW_DEPTH = "1"
 # Increase git fetch timeout for large repos on slow connections
 BB_FETCH_PREMIRRORONLY = "0"
 FETCHCMD_git = "git -c core.fsyncobjectfiles=0"
-
-require conf/machine/include/obmc-bsp-common.inc
