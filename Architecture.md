@@ -45,13 +45,6 @@ meta-johnblue/
     └── main.xml
 ```
 
-> **Note:** an earlier iteration of this layer included a `recipes-phosphor/pldm-terminus/`
-> loopback mock (`pldm-terminus.c` + `mctp-lo-setup.service`) that answered `pldmtool`
-> queries directly over an `AF_MCTP` loopback socket, with **zero I2C bus interaction**.
-> It has been removed: it never exercised the kernel's `aspeed_i2c` / `mctp-i2c` driver
-> path at all, so it could not validate anything about the real device model. All PLDM
-> traffic now goes over the real I2C wire path described below.
-
 This structure enables modular development and easy integration with the OpenBMC build system.
 
 ## Design Flow Introduction
@@ -119,7 +112,7 @@ mctpd
 
 ## Implementation Status: QEMU Device Model
 
-This layer uses a QEMU I2C device model as the PLDM terminus. This is **not a software loopback mock** — every byte of every PLDM/MCTP transaction actually crosses the QEMU-emulated `aspeed_i2c` bus and is processed by the real Linux kernel driver stack (`aspeed_i2c.c` → `mctp-i2c.c` → `AF_MCTP` → `mctpd`/`pldmtool`). This was verified end-to-end (see [Verification History](#verification-history) below).
+This layer uses a QEMU I2C device model as the PLDM terminus. This is **not a software loopback mock** — every byte of every PLDM/MCTP transaction actually crosses the QEMU-emulated `aspeed_i2c` bus and is processed by the real Linux kernel driver stack (`aspeed_i2c.c` → `mctp-i2c.c` → `AF_MCTP` → `mctpd`/`pldmtool`). See [How to Verify](README.md#how-to-verify) in the README for the exact commands that confirm this end-to-end.
 
 ### What is real
 
@@ -292,28 +285,198 @@ For actual Yocto builds, only the comprehensive patch above is used.
 
 ---
 
-## Verification History
+## Source Code Walkthrough
 
-The real device-model path (as opposed to the removed loopback mock) did not work
-out of the box. Getting `mctp neigh show` to show a genuine, wire-verified EID 10 and
-`pldmtool` to return correct sensor values required finding and fixing 11 distinct bugs,
-each confirmed via kernel dynamic-debug / temporary `dev_info` tracing rather than
-guesswork:
+The sections above describe *what* the device model does. This section explains *why*
+it's built the way it is, function by function, assuming no prior QEMU device-model
+experience. If you've never written a QEMU device before, read
+[Background Concepts](#background-concepts) first — everything after it leans on those
+ideas without re-explaining them.
 
-1. **I2C address collision** between the BMC's own slave address and the terminus address
-2. **Frame-parsing offset bug** in `process_mctp_frame()` — fields read from the wrong byte offsets
-3. **Un-paced response bytes** — see [Response Mechanism](#response-mechanism-aspeed-ast2600-old-mode-i2c) above
-4. **STOP-event timing** — `i2c_end_transfer()` called synchronously instead of a tick after the last byte
-5. **Address-phase byte overwrite** — address phase and byte 0 shared one hardware register with no delay between them
-6. **`byte_count` incorrectly included the PEC byte**, causing the kernel to reject every otherwise-correct frame on a length mismatch
-7. **Missing `MCTP_I2C_COMMANDCODE` definition** causing a build/logic bug in frame validation
-8. **CRC-8 PEC computed over the wrong length** (`crc8_smbus(pec_buf, 1 + idx - 1)` excluded the final byte from the checksum), failing PEC validation on content that was otherwise byte-perfect
-9. **MCTP transport header fields transposed** in `build_mctp_frame()` — the SOM/EOM/TO/tag byte and the header-version byte were swapped, so every response passed the I2C-layer framing/PEC check but was silently dropped by the kernel's MCTP core, which is why `mctpd`'s `AssignEndpointStatic` timed out even after bug #8 was fixed
-10. **`PDRNumericSensor` struct didn't byte-match libpldm's real DSP0248 layout** — `container_id` was 1 byte instead of 2, two fields (`rel`, `aux_oem_unit_handle`) were missing entirely, and `hysteresis`/`max_readable`/`min_readable` were 4 bytes instead of 2 (they're sized per `sensor_data_size`, not fixed `uint32_t`) — this caused `pldmtool platform GetPDR` to decode the header but fail body decoding
-11. **Wrong PLDM enum values** for sensor operational/present/previous/event state (`0x00`/`0x01` swapped), which made `GetSensorReading` report "Sensor Disabled" / "Sensor Unknown" instead of "Sensor Enabled" / "Sensor Normal" even though `presentReading` was already correct
+### Background Concepts
 
-After all 11 fixes, a clean rebuild (kernel + FIT image + full `obmc-phosphor-image`,
-with no debug instrumentation) was booted fresh and re-verified: `mctp neigh show` shows
-EID 10, `pldmtool base GetTID/GetPLDMTypes`, `platform GetPDR` (both records fully
-decode), and `platform GetSensorReading` (42 / 1198) all succeed over the real wire path
-with zero failed systemd units.
+**QOM (QEMU Object Model).** Every QEMU device — real or emulated — is a C "object"
+with a type name, a state struct, and lifecycle callbacks (`realize`/`unrealize`)
+that QEMU calls automatically when the device is created/destroyed. You don't call
+these yourself; you register them in a `TypeInfo` and QEMU's object system invokes
+them at the right time. This is why `mctp_i2c_ep_realize()` looks like it's never
+called from anywhere in this file — it's wired up via `mctp_i2c_ep_class_init()` and
+invoked by the QOM machinery when the machine file instantiates the device.
+
+**The BQL (Big QEMU Lock).** QEMU's device emulation is fundamentally single-threaded:
+one thread runs the emulated guest CPU *and* all device callbacks, one at a time, under
+a single global lock. This means a device callback that loops or blocks stops the guest
+CPU from running at all until the callback returns — there is no "meanwhile the guest
+handles its interrupt" happening concurrently. Any device that needs to spread work out
+over time (like sending bytes one at a time, waiting for the guest to react to each one)
+has to give control back to the main loop between steps, rather than looping internally.
+That's what bottom halves and timers (below) are for.
+
+**Bottom halves (BH) and timers.** A QEMU bottom half (`QEMUBH`) is a "run this function
+soon, but not right now, from the main loop" callback — it lets a device defer work
+instead of doing it inline inside an interrupt-context callback. A `QEMUTimer` is the
+same idea but scheduled for a specific point on a virtual clock instead of "as soon as
+possible". This device uses a BH to *kick off* the response (right after processing a
+request), then a timer to *pace* each subsequent byte of that response — see
+[Response Mechanism](#response-mechanism-aspeed-ast2600-old-mode-i2c) for why the pacing
+itself is necessary.
+
+**I2C slave vs. master, and why bytes arrive one at a time.** On a real I2C bus, one
+device (the "master") drives the clock and addresses another device (the "slave") to
+either write bytes to it or read bytes from it. QEMU's I2C core delivers a slave device
+every byte of an incoming write through one callback (`.send`) and asks it for the next
+outgoing byte through another (`.recv`), with separate "event" callbacks marking the
+start/end of a transaction. There is no "give me the whole frame at once" API — that's
+why this device has to accumulate bytes into `rx_buf` as they arrive and only look at
+the complete frame once a `I2C_FINISH` event says the transaction is done.
+
+**EIDs, MCTP, and PLDM, in one sentence each.** An EID (Endpoint ID) is an 8-bit address
+identifying one endpoint on an MCTP network — like an IP address, but for management
+traffic. MCTP wraps a message in a small header (source/destination EID, a tag, and
+start/end-of-message flags) so it can be split across multiple physical packets and
+reassembled. PLDM is one specific *kind* of message that travels inside an MCTP payload,
+identified by a "PLDM type" byte (Type 0 = Base/discovery, Type 2 = Platform Monitoring
+in this repo) and further split into numbered commands within that type.
+
+**PEC (Packet Error Code).** A single CRC-8 checksum byte appended to every DSP0237
+frame, computed over the I2C address byte plus everything else in the frame. It's the
+I2C-level equivalent of a network packet checksum: without it, a corrupted byte on the
+wire (or, during development, a corrupted byte from a device-model bug) would be silently
+accepted as valid data.
+
+### `mctp_i2c_endpoint.h` — the device's state
+
+Every QOM device needs a state struct holding everything that must persist between
+callback invocations (QEMU calls your callbacks repeatedly with no memory of previous
+calls except what you stored in this struct). `MCTPEndpointState` holds:
+
+- `rx_buf` / `rx_len` — the incoming frame, built up one byte per `.send` callback
+  invocation, since (as above) I2C delivers a write one byte at a time
+- `resp_buf` / `resp_len` / `resp_pos` — the outgoing response frame and how much of
+  it has been sent so far; needed because, symmetrically, the response also has to go
+  out one byte at a time, spread across many timer callbacks, not in one shot
+- `resp_addr_sent` — tracks whether the response's I2C address phase has already
+  happened, so the timer-driven state machine knows whether its next step is "address
+  the bus" or "send the next data byte"
+- `bus_ref` — a handle to the I2C bus this device sits on, needed because sending a
+  response means *this device* has to act as a bus master and address the BMC, which
+  requires knowing which bus to drive
+- `bh` / `resp_timer` — the bottom half and timer used to pace the response (see
+  [Background Concepts](#background-concepts))
+- `eid` / `tid` — this endpoint's current MCTP Endpoint ID (starts at 0, meaning
+  "unassigned", until `mctpd` assigns one via `SetEndpointID`) and its PLDM Terminus ID
+
+### `mctp_i2c_endpoint.c`, top to bottom
+
+**Wire-level constants** (`TERMINUS_I2C_ADDR`, `BMC_I2C_SLAVE_ADDR`, `MCTP_HDR_VER`,
+`MCTP_I2C_COMMANDCODE`, message type/command code enums). These exist because DSP0237/
+DSP0236/DSP0240/DSP0248 are all fixed-format binary wire protocols — every field's
+meaning and position is dictated by the spec, not by this code, so the constants are
+just named versions of numbers a real PLDM terminus and a real MCTP-over-I2C kernel
+driver both already agree on.
+
+**`PDRHeader` / `PDRNumericSensor` / `PDRNumericRecord` structs, and `pdr_repo[]`.**
+A PDR (Platform Data Record) is how a PLDM platform tells a requester "here is a sensor,
+here's its ID, its unit, its normal/warning/critical thresholds, etc." Real firmware
+would generate these at runtime or store them in flash; this device model hard-codes two
+of them (`pdr_repo[]`) because there's no real hardware behind these sensors — the *data
+model* is real (`pldmtool`/`pldmd` parse it with the exact same code they'd use against
+real hardware), only the *values* are canned. The struct layout matters more than it
+might look: it has to match libpldm's real `struct pldm_numeric_sensor_value_pdr`
+byte-for-byte (field widths, field order, no extra or missing fields), because a real
+PLDM requester decodes the raw bytes using that exact structure — if a field is the wrong
+width, every field after it in the struct shifts and decoding falls apart, even though
+each individual value would have been "correct" in isolation.
+
+**`crc8_smbus()`.** A standalone implementation of the CRC-8/SMBUS polynomial (0x07)
+used to compute the PEC byte described above. It's a small, self-contained function
+because the PEC calculation is identical regardless of which command produced the frame
+being checksummed — every response, whatever its content, goes through the same
+checksum step.
+
+**`build_mctp_frame()`.** Every single response this device sends — whether it's an
+MCTP Control reply, a PLDM Base reply, or a PLDM PMC reply — needs the exact same
+envelope wrapped around it: an I2C command byte, a byte count, a source address field,
+a 4-byte MCTP transport header, and a trailing PEC. Rather than duplicating that framing
+logic in three different handler functions, all three call this one function at the end
+and just hand it their protocol-specific payload bytes. This is the mirror image of
+`process_mctp_frame()` below: one function strips the envelope off an incoming frame,
+one function puts it back on an outgoing one.
+
+**`handle_mctp_control()` / `handle_pldm_base()` / `handle_pldm_pmc()`.** These three
+handlers exist because the protocols they implement are genuinely layered and
+independent: MCTP Control (Type 0 *message*) is about identity and addressing at the
+transport level (`SetEndpointID`, `GetEndpointID`, ...), PLDM Base (Type 0 *PLDM type*,
+carried inside an MCTP Type 1 message) is about discovering what a PLDM terminus
+supports (`GetTID`, `GetPLDMTypes`, ...), and PLDM PMC (Type 2) is the actual
+sensor/effecter data model (`GetPDR`, `GetSensorReading`, ...). `process_mctp_frame()`
+looks at the message type (and, for PLDM, the PLDM type) and routes to whichever handler
+owns that layer — the three-way split in code reflects a three-way split that already
+exists in the specs, not an arbitrary code-organization choice.
+
+**`process_mctp_frame()`.** The counterpart to `build_mctp_frame()`: given the raw bytes
+accumulated in `rx_buf`, this validates the DSP0237 envelope (command code, declared
+byte count vs. actual bytes received) and pulls out the destination/source EID and tag
+from the MCTP transport header, then looks at the message type byte to decide which of
+the three handlers above should see the rest of the payload. This validation has to
+happen here, before any handler runs, because a malformed or truncated frame (dropped
+bytes, wrong command code) is meaningless to interpret as MCTP/PLDM content — there's no
+point asking "what PLDM command is this" if the envelope around it isn't even valid.
+
+**`mctp_i2c_resp_bh()`.** The timer-driven state machine that actually gets the response
+onto the wire. See [Response Mechanism](#response-mechanism-aspeed-ast2600-old-mode-i2c)
+for the detailed reasoning; in short, this function exists (rather than simply looping
+over `resp_buf` and calling `i2c_send_async()` for every byte in one go) because of the
+BQL constraint described in [Background Concepts](#background-concepts) — the guest's
+interrupt handler needs a turn to run *between* every single byte, which only happens if
+this device gives control back to the main loop and gets called again later for the next
+byte.
+
+**`mctp_i2c_ep_send()` / `mctp_i2c_ep_event()`.** These are the actual QOM callbacks
+QEMU's I2C core invokes on this device — `.send` once per incoming byte (append it to
+`rx_buf`), `.event` on transaction boundaries (`I2C_START_SEND` resets `rx_len` for a
+fresh frame; `I2C_FINISH` means a complete frame has arrived, so this is where
+`process_mctp_frame()` gets called and, if it produced a response, the BH gets scheduled
+to start sending it). There is deliberately no `.recv` callback — this device never has
+data pulled out of it by a master read; all of its responses go out via *it* acting as a
+master (through `i2c_start_send_async`/`i2c_send_async`), matching how the real
+`mctp-i2c` kernel driver's slave-receive path expects to receive responses.
+
+**`mctp_i2c_ep_realize()` / `mctp_i2c_ep_unrealize()` / `mctp_i2c_ep_class_init()`.**
+The QOM lifecycle functions from [Background Concepts](#background-concepts): `realize`
+initializes all the state-struct fields to their startup values and allocates the BH and
+timer this device needs; `unrealize` frees them again when the device is destroyed (QEMU
+timers and bottom halves are tracked in global lists — forgetting to free them here would
+leak a callback pointing at a device that no longer exists). `class_init` is where the
+`.send`/`.event` function pointers actually get wired into the `I2CSlaveClass`, which is
+how QEMU's generic I2C bus code knows which functions belong to *this* device type.
+
+### `aspeed_ast2600_johnblue.c` — the machine file
+
+QEMU's board-level configuration (which devices exist, on which buses, at which
+addresses) is defined per-"machine" (the thing you select with `-machine <name>`), not
+per-device. The upstream `ast2600-evb` machine has no idea this MCTP endpoint device
+exists, so rather than modifying upstream EVB code, this file defines a new machine,
+`ast2600-johnblue`, that reuses everything from EVB and adds one extra line —
+`i2c_slave_create_simple(..., TYPE_MCTP_I2C_ENDPOINT, TERMINUS_I2C_ADDR)` — placing the
+device on I2C bus 1 at address `0x0f`. `johnblue.conf`'s `QB_MACHINE` override is what
+tells `runqemu` to boot this machine instead of the stock EVB one.
+
+### Why the Kconfig / meson.build changes are needed
+
+QEMU's build system needs to be told about a new source file in two independent places,
+and this project touches both `hw/i2c` (where the device lives) and `hw/arm` (where the
+machine lives):
+
+- **`hw/i2c/Kconfig`** declares a `MCTP_I2C_ENDPOINT` feature symbol so the device can be
+  selected/deselected like any other optional QEMU feature
+- **`hw/i2c/meson.build`** is what actually adds `mctp_i2c_endpoint.c` to the list of
+  files compiled, conditional on that Kconfig symbol being enabled
+- **`hw/arm/Kconfig`**'s `select MCTP_I2C_ENDPOINT` on `ASPEED_SOC` turns that feature on
+  automatically for any Aspeed machine, so you don't have to enable it by hand
+- **`hw/arm/meson.build`** adds `aspeed_ast2600_johnblue.c` to the list of files compiled
+  for ARM targets — without this, the new machine type would never even be registered
+
+This four-file pattern (device Kconfig + device meson.build + SoC Kconfig select + arch
+meson.build) is the same pattern QEMU's own upstream device patches use, which is why
+it's mirrored here rather than inventing a different build-integration approach.
