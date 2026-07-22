@@ -8,7 +8,7 @@ exercising the full real kernel MCTP/PLDM driver stack — `aspeed_i2c`, `mctp-i
 This document covers repo setup, building, running, and verifying the environment. For
 source code layout, the QEMU device model internals, protocol/command coverage, and the
 history of bugs found while getting the real path working, see
-**[Architecture.md](Architecture.md)**.
+**[ARCHITECTURE.md](ARCHITECTURE.md)**.
 
 ## Repo initialization
 
@@ -62,6 +62,44 @@ MCTP is the transport layer for platform management traffic between components (
 host CPU, NICs, PSUs, add-in cards, etc.). It defines addressing, packet framing, and
 transport bindings over physical buses, independent of whatever protocol rides on top.
 
+Think of MCTP as a common management envelope rather than a new physical bus. The
+wire can change from one segment to another, while the endpoint still gets an EID and
+the message keeps the same MCTP meaning:
+
+```text
+                         one logical MCTP network
+    I2C / SMBus             PCIe VDM                 USB / UART
+  .---------------.       .---------------.        .---------------.
+  | BMC (EID 8)   |       | NIC/SSD       |        | service MCU    |
+  | PSU (EID 10)  |       | (EID 20)      |        | (EID 30)       |
+  '-------+-------'       '-------+-------'        '-------+-------'
+          \                       |                        /
+           \                      |                       /
+            '---------------------+----------------------'
+                       EID-based routing
+                 same management message semantics
+```
+
+The transport binding handles the local bus details, such as I2C addresses or PCIe
+vendor-defined messages. MCTP supplies the shared layer above them: EIDs identify
+endpoints, headers mark message boundaries, and sequence fields let a long message be
+split into packets and reassembled. A bus owner such as `mctpd` discovers endpoints and
+assigns their EIDs before application traffic begins.
+
+In this project the physical path is deliberately concrete:
+
+```text
+QEMU endpoint (I2C address 0x0f, EID 10)
+  |
+  | DSP0237 MCTP-over-SMBus frame
+  v
+AST2600 I2C controller -> Linux mctp-i2c -> AF_MCTP socket
+  |
+  | same MCTP network semantics, different local transport machinery
+  v
+BMC endpoint (EID 8) -> mctpd -> PLDM requester
+```
+
 **Common / baseline support** — present in essentially any conformant MCTP stack:
 - A single physical transport binding (this repo: I2C/SMBus per **DSP0237**)
 - Packetization and reassembly: message fragmentation across packets using the
@@ -86,7 +124,7 @@ is exercised by this repo:
   encrypted MCTP traffic over networked transports
 
 This repo implements exactly the common/baseline set: one I2C transport binding, full
-packet framing (see [Architecture.md § Response Mechanism](Architecture.md#response-mechanism-aspeed-ast2600-old-mode-i2c)),
+packet framing (see [ARCHITECTURE.md § Response Mechanism](ARCHITECTURE.md#response-mechanism-aspeed-ast2600-old-mode-i2c)),
 and the four MCTP Control commands needed for real `SetEndpointID` discovery.
 
 ### PLDM (Platform Level Data Model) — DSP0240 family
@@ -94,6 +132,32 @@ and the four MCTP Control commands needed for real `SetEndpointID` discovery.
 PLDM is a higher-layer data/command model that runs as MCTP message Type 1 on top of the
 transport above. Each PLDM "Type" below is an independently defined command set for a
 specific management domain.
+
+The layering is easiest to see as a message travelling downward to the bus and then
+upward at the terminus. MCTP does not know that the payload is a temperature reading;
+it only delivers the payload to the endpoint. PLDM gives that payload its management
+meaning:
+
+```text
+Requester: BMC / pldmtool                         Terminus: NIC, PSU, or QEMU device
+---------------------------                       -------------------------------
+PLDM PMC command:                                PLDM PMC handler:
+  GetSensorReading(sensor=0x0001) -------------->  look up CPU temperature
+       |                                                  |
+       | PLDM message Type 1                              | response: 42 C
+       v                                                  v
+MCTP message header:                                  MCTP message header:
+  src EID 8, dst EID 10, tag 0                         src EID 10, dst EID 8
+       |                                                  ^
+       '---------------- MCTP transport ------------------'
+                         (I2C / SMBus frame)
+```
+
+That separation is the useful design boundary: MCTP can move the request across an
+I2C segment or another supported binding, while PLDM can describe discovery, PDRs,
+sensors, effecters, firmware, or BIOS data without reimplementing transport delivery.
+Here, PLDM Base discovers the terminus and its supported types; PLDM PMC then retrieves
+the PDR repository and sensor readings.
 
 **Common / baseline support:**
 - **PLDM Base (Type 0, DSP0240)** — the mandatory command set every PLDM terminus must
@@ -118,8 +182,8 @@ via `GetPLDMTypes`:
 
 This repo's QEMU terminus advertises exactly Type 0 (Base) and Type 2 (PMC) via
 `GetPLDMTypes`, and implements a subset of each type's commands — see
-[Architecture.md § Protocol Support](Architecture.md#protocol-support) for the exact
-command list and [Known Gaps](Architecture.md#known-gaps) for what's intentionally not
+[ARCHITECTURE.md § Protocol Support](ARCHITECTURE.md#protocol-support) for the exact
+command list and [Known Gaps](ARCHITECTURE.md#known-gaps) for what's intentionally not
 implemented (e.g. `GetPLDMCommands`).
 
 ---
@@ -400,7 +464,7 @@ journalctl -u pldmd.service -n 50 | grep -i "sensor\|pdr\|discover"
 ```
 
 Note: `pldmd`'s own autonomous `platform-mc` manager currently fails its internal
-discovery (`GetPLDMCommands` unsupported — see [Architecture.md § Known Gaps](Architecture.md#known-gaps)),
+discovery (`GetPLDMCommands` unsupported — see [ARCHITECTURE.md § Known Gaps](ARCHITECTURE.md#known-gaps)),
 so it will not expose the sensors as D-Bus objects on its own. This does not affect the
 manual `pldmtool` commands above, which talk to the device directly.
 
@@ -426,7 +490,7 @@ busctl call au.com.codeconstruct.MCTP1 \
     au.com.codeconstruct.MCTP.BusOwner1 AssignEndpointStatic ayy 1 0x0f 10
 ```
 
-**If `pldmd` logs discovery errors:** this is expected — see [Architecture.md § Known Gaps](Architecture.md#known-gaps).
+**If `pldmd` logs discovery errors:** this is expected — see [ARCHITECTURE.md § Known Gaps](ARCHITECTURE.md#known-gaps).
 It does not affect manual `pldmtool` queries; use those to verify the real path instead:
 ```bash
 journalctl -u pldmd.service | tail -50
@@ -436,4 +500,4 @@ systemctl status mctpd.service mctp-setup-i2c.service mctp-discover-terminus.ser
 ---
 
 For source code layout, the QEMU device model internals, and the full bug-fix history,
-see [Architecture.md](Architecture.md). For more details, refer to the OpenBMC documentation.
+see [ARCHITECTURE.md](ARCHITECTURE.md). For more details, refer to the OpenBMC documentation.
