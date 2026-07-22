@@ -6,9 +6,54 @@ exercising the full real kernel MCTP/PLDM driver stack — `aspeed_i2c`, `mctp-i
 `pldmd`/`pldmtool` — without needing physical hardware.
 
 This document covers repo setup, building, running, and verifying the environment. For
-source code layout, the QEMU device model internals, protocol/command coverage, and the
-history of bugs found while getting the real path working, see
-**[Architecture.md](Architecture.md)**.
+the architecture, service flow, implementation status, and QEMU device-model internals,
+see **[ARCHITECTURE.md](ARCHITECTURE.md)**.
+
+## Project Structure
+
+```
+meta-johnblue/
+├── README.md                               # Setup, build, run, verify, and repository overview
+├── ARCHITECTURE.md                         # Architecture and QEMU device-model internals
+├── conf/
+│   ├── layer.conf                          # Layer metadata, priorities, dependencies
+│   ├── machine/
+│   │   └── johnblue.conf                   # Machine definition (AST2600, QB_MACHINE override)
+│   └── templates/default/
+│       ├── bblayers.conf.sample            # Ready-to-use bblayers configuration
+│       └── local.conf.sample               # Ready-to-use local.conf with MACHINE=johnblue
+├── manifest/
+│   ├── main.xml                            # repo manifest (main branch)
+│   └── mocking.xml                         # repo manifest (mocking branch)
+├── recipes-devtools/
+│   ├── nodejs/
+│   │   ├── gcc12-wrapper/{gcc,g++}         # Host GCC 12 wrappers for the native nodejs build
+│   │   └── nodejs_24.18.0.bbappend         # Puts the wrappers on PATH (Ubuntu 22.04 has GCC 11)
+│   └── qemu/
+│       ├── files/
+│       │   └── 0001-hw-add-mctp-i2c-endpoint-and-ast2600-johnblue-machine.patch
+│       │       # All QEMU changes: device model + machine + build glue
+│       └── qemu-system-native_%.bbappend   # Applies the QEMU patch
+├── recipes-kernel/
+│   └── linux/
+│       ├── files/
+│       │   ├── 0001-aspeed-evb-add-mctp-controller-to-i2c1.patch  # DTS: mctp-controller on &i2c1
+│       │   └── i2c-slave-dev.cfg           # Kernel config fragment: I2C slave support
+│       ├── linux-aspeed_%.bbappend         # Applies the DTS patch and config fragment
+│       └── linux-yocto-fitimage.bbappend   # No-op; documents that the default FIT image is enough
+└── recipes-phosphor/
+    ├── images/
+    │   └── obmc-phosphor-image.bbappend    # Adds the MCTP/PLDM stack and dev tools to the image
+    ├── mctp/
+    │   ├── files/
+    │   │   ├── mctpd.conf                     # bus-owner mode, 5 s timeout
+    │   │   ├── mctp-setup-i2c.service         # Creates mctpi2c1 (I2C slave 0x10), adds BMC EID 8
+    │   │   └── mctp-discover-terminus.service # AssignEndpointStatic -> EID 10 over I2C
+    │   └── mctp_%.bbappend
+    └── pldm/
+        ├── files/host_eid                  # "10": read by pldmd's host-firmware path
+        └── pldm_%.bbappend
+```
 
 ## Repo initialization
 
@@ -26,15 +71,6 @@ Example `manifest/main.xml` settings:
   <project remote="openbmc" name="openbmc/openbmc" revision="master" path="." />
   <project remote="johnblue" name="HowToPLDM" revision="main" path="meta-johnblue" />
 </manifest>
-```
-
-Download repo binary:
-
-```bash
-mkdir -p ~/.bin
-PATH="${HOME}/.bin:${PATH}"
-curl https://googleapis.com > ~/.bin/repo
-chmod a+rx ~/.bin/repo
 ```
 
 From an empty workspace root, run:
@@ -85,15 +121,16 @@ is exercised by this repo:
 - Security extensions layered on top of the base control protocol for authenticated/
   encrypted MCTP traffic over networked transports
 
-This repo implements exactly the common/baseline set: one I2C transport binding, full
-packet framing (see [Architecture.md § Response Mechanism](Architecture.md#response-mechanism-aspeed-ast2600-old-mode-i2c)),
+This repo implements exactly the common/baseline set: one I2C transport binding, packet
+framing (see [ARCHITECTURE.md § Figure 2](ARCHITECTURE.md#figure-2-one-frame-byte-by-byte)),
 and the four MCTP Control commands needed for real `SetEndpointID` discovery.
 
 ### PLDM (Platform Level Data Model) — DSP0240 family
 
 PLDM is a higher-layer data/command model that runs as MCTP message Type 1 on top of the
 transport above. Each PLDM "Type" below is an independently defined command set for a
-specific management domain.
+specific management domain. PLDM types and MCTP message types are numbered separately, so
+PLDM Type 0 (Base) has nothing to do with MCTP message type 0 (Control).
 
 **Common / baseline support:**
 - **PLDM Base (Type 0, DSP0240)** — the mandatory command set every PLDM terminus must
@@ -118,8 +155,8 @@ via `GetPLDMTypes`:
 
 This repo's QEMU terminus advertises exactly Type 0 (Base) and Type 2 (PMC) via
 `GetPLDMTypes`, and implements a subset of each type's commands — see
-[Architecture.md § Protocol Support](Architecture.md#protocol-support) for the exact
-command list and [Known Gaps](Architecture.md#known-gaps) for what's intentionally not
+[ARCHITECTURE.md § Protocol Support](ARCHITECTURE.md#protocol-support) for the exact
+command list and [Known Gaps](ARCHITECTURE.md#known-gaps) for what's intentionally not
 implemented (e.g. `GetPLDMCommands`).
 
 ---
@@ -150,13 +187,10 @@ The `meta-johnblue` layer is already included in the provided configuration samp
 
 #### Option A: Use the Provided Configuration Sample (Recommended)
 
-```bash
-# Copy the provided bblayers.conf.sample to your build configuration
-cp meta-johnblue/conf/templates/default/bblayers.conf.sample build/conf/bblayers.conf
-
-# Also copy local.conf.sample if you haven't set it up yet
-cp meta-johnblue/conf/templates/default/local.conf.sample build/conf/local.conf
-```
+Nothing to copy by hand. `. setup johnblue` (step 2) finds
+`meta-johnblue/conf/machine/johnblue.conf`, and on first run creates the build
+directory `build/johnblue/` with its `conf/` generated from
+`meta-johnblue/conf/templates/default/`.
 
 The `bblayers.conf.sample` file already includes the `meta-johnblue` layer:
 
@@ -174,28 +208,29 @@ BBLAYERS ?= " \
   "
 ```
 
-Set the machine in local.conf:
+and `local.conf.sample` already sets the machine:
 
 ```bash
-# build/conf/local.conf
-MACHINE = "johnblue"
+# build/johnblue/conf/local.conf
+MACHINE ??= "johnblue"
 ```
 
 #### Option B: Manual Setup
 
-If you already have `build/conf/bblayers.conf`, add the layer manually:
+If you already have a build directory (say `build/johnblue/`) that was created without
+this layer, add the layer manually:
 
 ```bash
-# Edit build/conf/bblayers.conf
-# Add to BBLAYERS:
-BBLAYERS += "${TOPDIR}/../meta-johnblue"
+# Edit build/johnblue/conf/bblayers.conf
+# Add to BBLAYERS (TOPDIR is build/johnblue, so the layer is two levels up):
+BBLAYERS += "${TOPDIR}/../../meta-johnblue"
 ```
 
 Or use `bitbake-layers`:
 
 ```bash
-cd build
-bitbake-layers add-layer ../meta-johnblue
+cd build/johnblue
+bitbake-layers add-layer ../../meta-johnblue
 ```
 
 ### 2. Build the OpenBMC Image
@@ -219,13 +254,14 @@ This will:
 
 **Output**: The built image will be located in:
 ```
-build/tmp/deploy/images/johnblue/
+build/johnblue/tmp/deploy/images/johnblue/
 ```
 
 Look for files like:
-- `obmc-phosphor-image-johnblue.rootfs.mtdimage`
-- `obmc-phosphor-image-johnblue.rootfs.tar.bz2`
-- `zImage-*`
+- `obmc-phosphor-image-johnblue.static.mtd` (also linked as `image-bmc`): the 64 MB
+  flash image that `runqemu` boots
+- `obmc-phosphor-image-johnblue.static.mtd.tar`: the firmware update tarball
+- `fitImage`, `zImage`: the kernel
 
 ### 3. Run QEMU
 
@@ -239,15 +275,18 @@ runqemu johnblue slirp nographic
 **QEMU Options** (optional - runqemu handles defaults):
 
 ```bash
-# Run with TCP serial console (easier to use)
-runqemu johnblue serial tcp nographic
+# Print runqemu's debug output, including the full QEMU command line
+runqemu johnblue slirp nographic -d
 
-# Run with more verbose output
-runqemu johnblue kvm nographic
-
-# Run with USB networking (if needed)
-runqemu johnblue net nic,model=e1000
+# Log guest errors (qemu_log_mask LOG_GUEST_ERROR) to a file instead of the console.
+# Other QEMU models (ftgmac100, PHY, SCU) log harmless noise here too, so filter for
+# the device model, e.g. "mctp-i2c-endpoint: bad command code"
+runqemu johnblue slirp nographic qemuparams="-d guest_errors -D /tmp/qemu-guest-errors.log"
+grep mctp-i2c-endpoint /tmp/qemu-guest-errors.log
 ```
+
+`kvm` is not available: this machine sets no `QB_CPU_KVM`, and an ARM guest cannot use
+KVM on an x86 host.
 
 ### 4. Access the QEMU BMC Console
 
@@ -264,9 +303,11 @@ johnblue login:
 **Or use SSH** (after QEMU boots):
 
 ```bash
-# From your host machine (in another terminal)
-ssh root@192.168.7.2
-# Replace IP if different - check QEMU network config
+# From your host machine (in another terminal). With slirp, johnblue.conf's
+# QB_SLIRP_OPT forwards host port 2222 -> BMC 22 and host 4433 -> BMC 443 (HTTPS).
+# If a TCP port is busy, runqemu picks another one and prints it at startup
+# ("Port forward changed: 2222 -> 2223").
+ssh -p 2222 root@localhost
 ```
 
 ### 5. Verify Services in QEMU
@@ -274,7 +315,7 @@ ssh root@192.168.7.2
 Once logged into the QEMU BMC, do a quick sanity check:
 
 ```bash
-# Verify the MCTP I2C interface came up (created by mctp-i2c kernel driver)
+# Verify the MCTP I2C interface came up (created by mctp-setup-i2c.service)
 mctp link show
 # Expected: mctpi2c1 listed as UP
 
@@ -299,7 +340,10 @@ To stop QEMU:
 # Inside QEMU BMC shell, run:
 poweroff
 
-# Or from host machine (if running in background), use Ctrl+C or:
+# Or, in the QEMU console, press Ctrl+A then X
+# (with nographic, Ctrl+C goes to the guest, not to QEMU)
+
+# Or from another host terminal:
 pkill qemu
 ```
 
@@ -317,7 +361,7 @@ bitbake obmc-phosphor-image
 **If `runqemu` cannot find the image:**
 ```bash
 # Verify image exists
-ls -la build/tmp/deploy/images/johnblue/
+ls -la build/johnblue/tmp/deploy/images/johnblue/
 
 # Check if johnblue machine configuration is found
 find . -name "johnblue.conf"
@@ -326,11 +370,17 @@ find . -name "johnblue.conf"
 **If QEMU fails to boot:**
 ```bash
 # Check for kernel/dtb issues
-ls -la build/tmp/deploy/images/johnblue/
+ls -la build/johnblue/tmp/deploy/images/johnblue/
 
-# Try with different QEMU options
-runqemu qemuarm johnblue nographic
+# Check which QEMU command runqemu builds (machine should be ast2600-johnblue)
+runqemu johnblue slirp nographic -d
 ```
+
+**If QEMU exits with `Could not set up host forwarding rule 'udp::6233-:623'`:** another
+QEMU on the host already forwards UDP 6233. runqemu only checks TCP ports when looking
+for free ones, so it does not move this UDP (IPMI) forward. Stop the other QEMU, or
+change the UDP port in `QB_SLIRP_OPT` in `conf/machine/johnblue.conf` and rebuild the
+image, which regenerates the `.qemuboot.conf` that runqemu reads.
 
 ## How to Verify
 
@@ -339,7 +389,8 @@ After `runqemu johnblue slirp nographic` boots to the login prompt, log in as `r
 ### 1. Verify MCTP I2C transport is up
 
 ```bash
-# mctpi2c1 is created by the kernel mctp-i2c driver via the DTS mctp-controller property
+# mctpi2c1 is created when mctp-setup-i2c.service instantiates the mctp-i2c client at
+# 0x10 on i2c-1; the DTS mctp-controller property is what lets it attach to that bus
 mctp link show
 # Expected: mctpi2c1 is listed as UP
 
@@ -399,19 +450,21 @@ systemctl status pldmd.service
 journalctl -u pldmd.service -n 50 | grep -i "sensor\|pdr\|discover"
 ```
 
-Note: `pldmd`'s own autonomous `platform-mc` manager currently fails its internal
-discovery (`GetPLDMCommands` unsupported — see [Architecture.md § Known Gaps](Architecture.md#known-gaps)),
-so it will not expose the sensors as D-Bus objects on its own. This does not affect the
-manual `pldmtool` commands above, which talk to the device directly.
+Note: `pldmd` does not expose the sensors as D-Bus objects yet. The device does not
+implement `GetPLDMCommands`, so pldmd logs `GetPLDMCommands ... complete code 5`, treats
+every command as unsupported, and skips the PDR walk (see
+[ARCHITECTURE.md § Figure 7](ARCHITECTURE.md#figure-7-where-pldmd-stops-today)). This does
+not affect the manual `pldmtool` commands above, which talk to the device directly.
 
 ### Troubleshooting
 
 **If `mctpi2c1` does not appear:**
 
 ```bash
+systemctl status mctp-setup-i2c.service
 dmesg | grep -i "mctp\|i2c"
 # Check the DTS patch was applied: &i2c1 should have mctp-controller property
-cat /proc/device-tree/ahb/apb/i2c@1e78a080/mctp-controller 2>/dev/null && echo present
+[ -e /sys/bus/i2c/devices/i2c-1/of_node/mctp-controller ] && echo present
 ```
 
 **If `mctp neigh show` does not show EID 10:**
@@ -426,7 +479,10 @@ busctl call au.com.codeconstruct.MCTP1 \
     au.com.codeconstruct.MCTP.BusOwner1 AssignEndpointStatic ayy 1 0x0f 10
 ```
 
-**If `pldmd` logs discovery errors:** this is expected — see [Architecture.md § Known Gaps](Architecture.md#known-gaps).
+**If `pldmd` logs `GetPLDMCommands` errors:** this is expected, as are the
+`query device identifiers` timeout and `Failed to config event receiver` lines. See
+[ARCHITECTURE.md § Figure 7](ARCHITECTURE.md#figure-7-where-pldmd-stops-today), which
+explains each line pldmd logs at boot.
 It does not affect manual `pldmtool` queries; use those to verify the real path instead:
 ```bash
 journalctl -u pldmd.service | tail -50
@@ -435,5 +491,5 @@ systemctl status mctpd.service mctp-setup-i2c.service mctp-discover-terminus.ser
 
 ---
 
-For source code layout, the QEMU device model internals, and the full bug-fix history,
-see [Architecture.md](Architecture.md). For more details, refer to the OpenBMC documentation.
+For how all of this fits together, see [ARCHITECTURE.md](ARCHITECTURE.md). For more
+details, refer to the OpenBMC documentation.

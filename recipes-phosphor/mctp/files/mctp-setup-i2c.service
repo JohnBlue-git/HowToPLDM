@@ -1,20 +1,20 @@
 [Unit]
 Description=MCTP I2C transport setup for QEMU AST2600 (i2c-1)
-# Start after mctpd is active; stop if mctpd stops.
+# Start after mctpd is active.
 After=mctpd.service
 Before=pldmd.service
-BindTo=mctpd.service
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
 
-# The mctp-i2c driver (CONFIG_MCTP_TRANSPORT_I2C=y, built-in) checks for the
-# "mctp-controller" OF property on the adapter to create the mctpi2cN netdev.
-# The DTS patch adds that property to i2c1, but the kernel notifier only fires
-# for adapters registered AFTER the mctp-i2c init runs (init order is i2c before
-# net, so aspeed adapters are already registered by then). We must trigger probe
-# manually via new_device so its bus_for_each_dev scan finds i2c-1.
+# The mctp-i2c driver (CONFIG_MCTP_TRANSPORT_I2C=y, built-in) creates an
+# mctpi2cN netdev only when BOTH exist: an "mctp-i2c-interface" I2C client
+# (the BMC's own slave endpoint) on the bus, and the "mctp-controller" OF
+# property on the adapter. The DTS patch adds only the property, with no
+# client child node (compatible = "mctp-i2c-controller"), so nothing is
+# probed at boot. Instantiate the client here via new_device; its probe
+# scans the bus, finds mctp-controller on i2c-1, and creates mctpi2c1.
 # NOTE: the i2c_device_id name is "mctp-i2c-interface", NOT "mctp-i2c".
 #
 # NOTE: this instantiates the BMC's OWN local port on the bus at
