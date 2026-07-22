@@ -1,52 +1,14 @@
-# meta-johnblue Project Documentation
+# Project Documentation
 
-## Project Structure
+This is a Yocto/OpenBMC layer that builds a QEMU-emulated AST2600 BMC (`ast2600-johnblue`)
+with a real MCTP-over-I2C PLDM terminus device model. It's a development environment for
+exercising the full real kernel MCTP/PLDM driver stack — `aspeed_i2c`, `mctp-i2c`, `mctpd`,
+`pldmd`/`pldmtool` — without needing physical hardware.
 
-```
-meta-johnblue/
-├── conf/
-│   ├── layer.conf                          # Layer metadata, priorities, dependencies
-│   ├── machine/
-│   │   └── johnblue.conf                   # Machine definition (AST2600, QB_MACHINE override)
-│   └── templates/default/
-│       ├── bblayers.conf.sample            # Ready-to-use bblayers configuration
-│       └── local.conf.sample               # Ready-to-use local.conf with MACHINE=johnblue
-├── recipes-devtools/
-│   └── qemu/
-│       ├── files/
-│       │   ├── 0001-hw-i2c-add-mctp-i2c-endpoint-device.patch
-│       │   │   # Standalone draft patch — mctp_i2c_endpoint.c only (reference, not used by build)
-│       │   └── 0001-hw-add-mctp-i2c-endpoint-and-ast2600-johnblue-machine.patch
-│       │       # Comprehensive Yocto patch — all QEMU changes (used by bbappend)
-│       └── qemu-system-native_%.bbappend   # Injects the QEMU patch into qemu-system-native build
-├── recipes-kernel/
-│   └── linux/
-│       ├── files/
-│       │   └── i2c-slave-dev.cfg           # Kernel config fragment: I2C slave support
-│       ├── linux-aspeed_%.bbappend         # Applies DTS patch (mctp-controller on i2c1)
-│       └── linux-yocto-fitimage.bbappend
-├── recipes-phosphor/
-│   ├── images/
-│   │   └── obmc-phosphor-image.bbappend    # Adds pldm-terminus to image
-│   ├── mctp/
-│   │   ├── files/
-│   │   │   ├── mctpd.conf                  # bus-owner mode, 5s timeout
-│   │   │   └── mctp-setup-i2c.service      # Brings up mctpi2c1, adds BMC EID 8
-│   │   └── mctp_%.bbappend
-│   ├── pldm/
-│   │   ├── files/host_eid                  # EID 10 — the QEMU endpoint's assigned EID
-│   │   └── pldm_%.bbappend
-│   └── pldm-terminus/
-│       ├── files/
-│       │   ├── pldm-terminus.c             # Loopback-only mock (superseded; kept for reference)
-│       │   ├── pldm-terminus.service
-│       │   └── mctp-lo-setup.service
-│       └── pldm-terminus_1.0.bb
-└── manifest/
-    └── main.xml
-```
-
-This structure enables modular development and easy integration with the OpenBMC build system.
+This document covers repo setup, building, running, and verifying the environment. For
+source code layout, the QEMU device model internals, protocol/command coverage, and the
+history of bugs found while getting the real path working, see
+**[Architecture.md](Architecture.md)**.
 
 ## Repo initialization
 
@@ -92,219 +54,73 @@ This creates `.repo/` in the current root and checks out the OpenBMC repository 
 
 If you use `repo init -u https://github.com/openbmc/openbmc.git`, that only works when the target repo contains the expected repo manifest metadata. For a normal manifest workflow, point `-u` at the manifest repository or use a manifest file with `-m`.
 
-## Design Flow Introduction
-
-The data flow in this project follows the full real-hardware path through the kernel's MCTP-over-I2C driver stack:
-
-```
-QEMU I2C device (mctp-i2c-endpoint @ bus1/0x0f)
-        ↓  DSP0237 MCTP-over-SMBus frames over virtual I2C
-Kernel: aspeed_i2c → mctp-i2c master driver → AF_MCTP socket
-        ↓
-mctpd (bus owner, EID discovery via SetEndpointID)
-        ↓
-pldmd / platform-mc (PLDM PDR walk, GetSensorReading polling)
-        ↓
-OpenBMC D-Bus / Redfish sensor objects
-```
-
-This exercises the **complete real kernel driver path** — `aspeed_i2c.c`, `mctp-i2c.c`, `mctpd`, and `pldmd` — using a QEMU I2C device model that speaks the same wire protocol as real PLDM terminus hardware.
-
 ## What are MCTP and PLDM?
 
-- **MCTP (Management Component Transport Protocol)** is the transport layer for platform management traffic. It carries management messages between endpoints and provides addressing, packet framing, and transport services over underlying buses such as I2C, PCIe, SMBus, or loopback.
-- **PLDM (Platform Level Data Model)** is a higher-layer protocol that runs on top of MCTP. PLDM defines standard platform management commands, discovery, sensor readouts, firmware update procedures, and other data model semantics.
-- In this repo, PLDM messages are transported over MCTP using AF_MCTP sockets. `mctpd`, `mctp-setup-i2c.service`, and `mctp-lo-setup.service` establish the MCTP transport, while `pldmd.service` and `pldm-terminus.service` exchange PLDM payloads over that transport.
+### MCTP (Management Component Transport Protocol) — DSP0236
 
-## MCTP / PLDM Device and Service Relationship
+MCTP is the transport layer for platform management traffic between components (BMC,
+host CPU, NICs, PSUs, add-in cards, etc.). It defines addressing, packet framing, and
+transport bindings over physical buses, independent of whatever protocol rides on top.
 
-With the QEMU I2C device model, the full service chain exercises the real kernel MCTP-over-I2C driver path.
+**Common / baseline support** — present in essentially any conformant MCTP stack:
+- A single physical transport binding (this repo: I2C/SMBus per **DSP0237**)
+- Packetization and reassembly: message fragmentation across packets using the
+  SOM (start-of-message) / EOM (end-of-message) / packet-sequence / message-tag fields
+  in the 4-byte MCTP transport header
+- Endpoint addressing via 8-bit Endpoint IDs (EIDs) — every message is framed with a
+  source and destination EID
+- **MCTP Control Protocol** (Type 0 messages): the mandatory discovery/setup command
+  set — `SetEndpointID`, `GetEndpointID`, `GetEndpointUUID`, `GetMCTPVersionSupport`,
+  `GetMessageTypeSupport`. A bus owner (`mctpd` here) uses these to discover and assign
+  EIDs to endpoints on the bus before any higher-layer protocol can run.
 
-- **QEMU I2C device** (`mctp-i2c-endpoint` at bus 1 / address `0x0f`)
-  - Handles all MCTP framing (DSP0237), MCTP Control (DSP0236), and PLDM protocols
-  - Visible to the Linux kernel as a real I2C slave via the `aspeed_i2c` virtual bus
-- **BMC side (EID 8)**
-  - `mctpd`: MCTP bus owner daemon — performs EID discovery (SetEndpointID → assigns EID 10 to the QEMU device)
-  - `mctp-setup-i2c.service`: brings up `mctpi2c1` (created automatically by the kernel `mctp-i2c` driver when the DTS `mctp-controller` property is present), adds BMC EID 8
-  - `pldmd.service`: PLDM daemon on the BMC
-- **Terminus side (EID 10)** — the QEMU I2C device model
-  - EID is assigned by `mctpd` at runtime via `SetEndpointID` (no static `mctp addr add` needed for terminus)
-  - Responds to all PLDM Base (Type 0) and PLDM PMC (Type 2) commands
-  - `pldm-terminus.service` (loopback mock) is still installed but no longer drives the I2C sensor path
+**Advanced / optional support** — part of the wider MCTP spec surface, not all of which
+is exercised by this repo:
+- Multiple physical transport bindings bridged into one logical MCTP network, with EIDs
+  routed across buses rather than confined to a single point-to-point link
+- Additional bindings beyond I2C: PCIe VDM (**DSP0238**), USB (**DSP0283**),
+  KCS (**DSP0254**), Serial/UART (**DSP0253**)
+- Endpoint Context / multi-key routing for endpoints reachable via more than one bus
+- Vendor Defined Messages (MCTP message types `0x7E`/`0x7F`) carrying vendor/OEM payloads
+- Security extensions layered on top of the base control protocol for authenticated/
+  encrypted MCTP traffic over networked transports
 
-**Service startup chain:**
+This repo implements exactly the common/baseline set: one I2C transport binding, full
+packet framing (see [Architecture.md § Response Mechanism](Architecture.md#response-mechanism-aspeed-ast2600-old-mode-i2c)),
+and the four MCTP Control commands needed for real `SetEndpointID` discovery.
 
-```
-mctpd
-  └─ mctp-setup-i2c.service   # brings up mctpi2c1, adds BMC EID 8
-       └─ pldmd.service        # BMC PLDM daemon; mctpd discovers QEMU device as EID 10
-```
+### PLDM (Platform Level Data Model) — DSP0240 family
 
-**Service relation diagram:**
+PLDM is a higher-layer data/command model that runs as MCTP message Type 1 on top of the
+transport above. Each PLDM "Type" below is an independently defined command set for a
+specific management domain.
 
-```
-[ mctpd ]   ←──── discovers QEMU I2C device, assigns EID 10
-    |
-    v
-[ mctp-setup-i2c.service ]   ←── mctpi2c1 up, BMC EID 8
-    |
-    v
-[ pldmd.service ]            ←── queries QEMU device: GetPDR, GetSensorReading
-```
+**Common / baseline support:**
+- **PLDM Base (Type 0, DSP0240)** — the mandatory command set every PLDM terminus must
+  implement: `GetTID`, `SetTID`, `GetPLDMTypes`, `GetPLDMVersion`, `GetPLDMCommands`.
+  This is the discovery layer a PLDM requester (`pldmd`/`platform-mc`, or `pldmtool`)
+  uses to learn what a terminus supports before issuing any type-specific commands.
 
-- `mctpd` performs real EID assignment via the `mctp-i2c` kernel driver.
-- `mctp-setup-i2c.service` creates the `mctpi2c1` network device (via kernel DT `mctp-controller` property on `&i2c1`) and adds BMC EID 8.
-- `pldmd.service` (platform-mc component) walks the PDR repository and polls `GetSensorReading`.
-- The QEMU I2C device model at `bus1/0x0f` handles all terminus-side PLDM logic.
+**Advanced / type-specific support** — each is its own optional PLDM Type, advertised
+via `GetPLDMTypes`:
 
----
+| Type | Name | Spec | Purpose |
+|---|---|---|---|
+| 0 | Base | DSP0240 | Discovery, versioning, command enumeration (mandatory) |
+| 1 | SMBIOS Transfer | DSP0246 | Retrieve SMBIOS structures over PLDM |
+| **2** | **Platform Monitoring and Control (PMC)** | **DSP0248** | **Sensors/effecters, PDR repository, `GetSensorReading` — implemented in this repo** |
+| 3 | BIOS Control and Configuration | DSP0247 | BIOS attribute table read/write |
+| 4 | FRU Data | DSP0257 | FRU record table discovery and retrieval |
+| 5 | Firmware Update | DSP0267 | Component-based firmware update state machine |
+| 6 | Redfish Device Enablement (RDE) | DSP0218 | Exposing Redfish resources through PLDM |
+| 7 | File Transfer | DSP0264 | Bulk file transfer over PLDM |
+| 63 | OEM | — | Vendor-defined extensions |
 
-## Implementation Status: QEMU Device Model
-
-This layer uses a QEMU I2C device model as the PLDM terminus. This is **not a pure software loopback mock** — it exercises the real kernel MCTP-over-I2C driver path while the terminus logic runs inside QEMU's device model infrastructure.
-
-### What is real
-
-- **`aspeed_i2c` driver**: the QEMU AST2600 I2C master emulation is the real upstream code
-- **`mctp-i2c` kernel driver**: the Linux kernel's `drivers/net/mctp/mctp-i2c.c` handles all framing
-- **`mctpd` EID assignment**: `SetEndpointID` flows over the real I2C path, not a static `mctp addr add`
-- **`pldmd` PDR walk and polling**: `pldmd`'s `platform-mc` component performs a real PDR repository walk and calls `GetSensorReading` periodically
-
-### What is simulated
-
-- **Sensor values**: CPU temp is statically 42 °C, 12V rail is statically 11.98 V — there is no actual hwmon driver behind these
-- **`pldm-terminus.service`**: the loopback-based userspace mock is still installed but is superseded by the I2C device model for actual I2C PLDM traffic
-
-### Data flow
-
-```
-pldmd / platform-mc (BMC EID 8)
-    ↓  AF_MCTP socket → mctp-i2c.c → aspeed_i2c.c
-    ↓  I2C master write (DSP0237 MCTP-over-SMBus frame)
-mctp-i2c-endpoint QEMU device (bus1/addr 0x0f, EID 10)
-    ↓  processes frame, builds response
-    ↓  i2c_start_send_async → Aspeed DMA slave ISR
-mctp-i2c.c → AF_MCTP → pldmd
-    ↓
-D-Bus sensor objects / Redfish
-```
-
----
-
-## QEMU I2C Device Model
-
-The core of this layer is a custom QEMU I2C slave device (`mctp-i2c-endpoint`) that replaces the AF_MCTP loopback mock with a proper in-QEMU terminus that exercises the real Linux kernel driver path.
-
-### Architecture
-
-```
-QEMU userspace
-  ┌──────────────────────────────────────────────────────────┐
-  │  aspeed_i2c master (I2C bus 1)                           │
-  │       ↕  I2C master writes/slave reads (QEMU I2C API)   │
-  │  mctp-i2c-endpoint (addr 0x0f)                           │
-  │       - DSP0237 MCTP-over-SMBus framing + PEC CRC-8      │
-  │       - MCTP Control (DSP0236): SetEID/GetEID             │
-  │       - PLDM Base (DSP0240, Type 0)                      │
-  │       - PLDM PMC (DSP0248, Type 2) + static PDR repo     │
-  └──────────────────────────────────────────────────────────┘
-         ↕  virtual I2C
-  ┌──────────────────────────────────────────────────────────┐
-  │  Linux kernel (in QEMU guest)                            │
-  │       aspeed_i2c.c  →  mctp-i2c.c  →  AF_MCTP socket   │
-  │       mctpd (EID discovery, SetEndpointID)               │
-  │       pldmd / platform-mc (PDR walk, GetSensorReading)   │
-  └──────────────────────────────────────────────────────────┘
-```
-
-### Device Details
-
-| Property | Value |
-|---|---|
-| QEMU type name | `mctp-i2c-endpoint` |
-| I2C bus | bus 1 (`mctpi2c1` in kernel) |
-| I2C address | `0x0f` (7-bit) |
-| Machine name | `ast2600-johnblue` |
-| Source file | `hw/i2c/mctp_i2c_endpoint.c` |
-| Header file | `include/hw/i2c/mctp_i2c_endpoint.h` |
-
-### Protocol Support
-
-| Protocol | Spec | Commands |
-|---|---|---|
-| MCTP-over-SMBus framing | DSP0237 | Full frame encode/decode, PEC CRC-8 |
-| MCTP Control | DSP0236 | `SetEndpointID`, `GetEndpointID`, `GetMCTPVersionSupport`, `GetMessageTypeSupport` |
-| PLDM Base | DSP0240 Type 0 | `GetTID`, `GetPLDMTypes`, `GetPLDMVersion` |
-| PLDM PMC | DSP0248 Type 2 | `GetPDRRepositoryInfo`, `GetPDR`, `GetSensorReading` |
-
-### Simulated Sensors
-
-| Sensor ID | Description | Type | Unit | Simulated Value |
-|---|---|---|---|---|
-| `0x0001` | CPU Temperature | `NumericSensorPDR` | °C (base_unit=2) | 42 °C |
-| `0x0002` | 12V Rail Voltage | `NumericSensorPDR` | V (base_unit=5, unitModifier=-2) | 11.98 V (reading=1198) |
-
-### Response Mechanism (Aspeed AST2600 New-Mode I2C)
-
-The AST2600 uses the "new mode" DMA slave path for I2C. When the QEMU device receives an MCTP frame (`I2C_FINISH` event), it:
-
-1. Parses the DSP0237 frame in `process_mctp_frame()`
-2. Dispatches to the appropriate handler (`handle_mctp_control`, `handle_pldm_base`, `handle_pldm_pmc`)
-3. Builds the response frame (prepends DSP0237 header, appends PEC CRC-8)
-4. Schedules a QEMU bottom half (`qemu_bh_schedule`)
-5. In the BH callback: calls `i2c_start_send_async(bus, BMC_I2C_SLAVE_ADDR=0x10)` then `i2c_send_async()` per byte
-
-This correctly triggers the Aspeed DMA slave ISR on the kernel side, making `mctp-i2c` see a properly-framed response.
-
-### QEMU Machine: `ast2600-johnblue`
-
-`aspeed_ast2600_johnblue.c` defines a new QEMU machine that clones `ast2600-evb` and adds the MCTP endpoint:
-
-```c
-// Places mctp-i2c-endpoint at I2C bus 1 / address 0x0f
-i2c_slave_create_simple(aspeed_i2c_get_bus(&soc->i2c, 1),
-                        TYPE_MCTP_I2C_ENDPOINT, 0x0f);
-```
-
-`johnblue.conf` overrides the inherited QEMU machine:
-
-```bitbake
-QB_MACHINE = "-machine ast2600-johnblue"
-```
-
----
-
-## QEMU Patch Files
-
-### `0001-hw-add-mctp-i2c-endpoint-and-ast2600-johnblue-machine.patch`
-
-This is the **active patch** applied by `qemu-system-native_%.bbappend`. It covers all 7 files needed to integrate the device model into QEMU 10.2.0:
-
-| File | Type | Description |
-|---|---|---|
-| `hw/i2c/mctp_i2c_endpoint.c` | new | Core device model (~855 lines): DSP0237 framing, MCTP Control, PLDM Base, PLDM PMC, 2 sensors, BH response path |
-| `include/hw/i2c/mctp_i2c_endpoint.h` | new | `MCTPEndpointState` struct, `TYPE_MCTP_I2C_ENDPOINT` constant |
-| `hw/arm/aspeed_ast2600_johnblue.c` | new | Machine `"ast2600-johnblue"`: clones EVB, places `mctp-i2c-endpoint` on bus 1 / addr `0x0f` |
-| `hw/i2c/Kconfig` | modified | Adds `config MCTP_I2C_ENDPOINT` (bool, selects I2C) |
-| `hw/i2c/meson.build` | modified | Conditionally compiles `mctp_i2c_endpoint.c` under `CONFIG_MCTP_I2C_ENDPOINT` |
-| `hw/arm/Kconfig` | modified | Adds `select MCTP_I2C_ENDPOINT` to `config ASPEED_SOC` |
-| `hw/arm/meson.build` | modified | Adds `aspeed_ast2600_johnblue.c` to the aspeed machine list |
-
-The patch is in standard `git format-patch` format with unified diffs. New files use `/dev/null` as the `a/` side.
-
-Key implementation notes:
-- `qemu/main-loop.h` must be included explicitly for `qemu_bh_new` / `qemu_bh_schedule` / `qemu_bh_delete` — these are not pulled in by `qemu/osdep.h`
-- The response is sent as a master-write to `BMC_I2C_SLAVE_ADDR=0x10` (not as a slave-read), matching the Aspeed DMA slave ISR path
-
-### `0001-hw-i2c-add-mctp-i2c-endpoint-device.patch`
-
-This is a **standalone draft** of `mctp_i2c_endpoint.c` only (~857 lines). It was generated during an early iteration before the Kconfig, meson.build, machine file, and header were finalized.
-
-- Contains only the device `.c` file (no Kconfig, no meson.build changes, no machine file, no header)
-- Missing the `#include "qemu/main-loop.h"` line (would fail to compile as-is)
-- **NOT referenced by the bbappend** — kept as a reference artifact
-
-For actual Yocto builds, only the comprehensive patch above is used.
+This repo's QEMU terminus advertises exactly Type 0 (Base) and Type 2 (PMC) via
+`GetPLDMTypes`, and implements a subset of each type's commands — see
+[Architecture.md § Protocol Support](Architecture.md#protocol-support) for the exact
+command list and [Known Gaps](Architecture.md#known-gaps) for what's intentionally not
+implemented (e.g. `GetPLDMCommands`).
 
 ---
 
@@ -395,9 +211,9 @@ bitbake obmc-phosphor-image
 ```
 
 This will:
-- Compile OpenBMC with the meta-johnblue layer's PLDM terminus mock
-- MCTP loopback services
-- All necessary dependencies
+- Rebuild `qemu-system-native` and `qemu-helper-native` with the custom `mctp-i2c-endpoint` device model patch
+- Compile the kernel with the `mctp-controller` DTS patch and I2C-slave config fragment
+- Install the MCTP/PLDM stack and discovery services (`mctpd`, `mctp-setup-i2c.service`, `mctp-discover-terminus.service`, `pldmd`)
 
 **Build time**: This can take 30 minutes to an hour depending on system performance. 
 
@@ -469,7 +285,7 @@ mctp neigh show
 # Expected: EID 10 (QEMU terminus) reachable via mctpi2c1
 
 # Check services
-systemctl status mctpd.service mctp-setup-i2c.service pldmd.service
+systemctl status mctpd.service mctp-setup-i2c.service mctp-discover-terminus.service pldmd.service
 
 # View logs
 journalctl -u pldmd.service -n 30
@@ -555,29 +371,38 @@ pldmtool base GetPLDMVersion -m 10 -t 0
 
 ### 4. Test PLDM PMC commands (Type 2) — sensors
 
+Note: this `pldmtool` build has no `GetPDRRepositoryInfo` subcommand — `GetPDR` covers
+individual records (`-d`), a PDR type (`-t`), a terminus (`-i`), or the whole repo (`-a`).
+`GetSensorReading` takes `-i <sensor_id> -r <rearm>` (both required).
+
 ```bash
-# Walk the PDR repository
-pldmtool platform GetPDRRepositoryInfo -m 10
-# Expected: 2 records in repo
+# Retrieve individual PDR records (0 = first record in the repository)
+pldmtool platform GetPDR -m 10 -d 0
+# Expected: NumericSensorPDR, sensorID=1, baseUnit="Degrees C(2)", dataLength=71
 
-pldmtool platform GetPDR -m 10 --record-handle 0
-# Expected: First NumericSensorPDR (CPU temp, sensor ID 1, unit °C)
+pldmtool platform GetPDR -m 10 -d 2
+# Expected: NumericSensorPDR, sensorID=2, baseUnit="Volts(5)", unitModifier=-2
 
-# Read sensor values
-pldmtool platform GetSensorReading -m 10 --sensor-id 1
-# Expected: sensorDataSize=1, presentReading=42 (CPU temp 42°C)
+# Read sensor values (rearm=0)
+pldmtool platform GetSensorReading -m 10 -i 1 -r 0
+# Expected: sensorOperationalState="Sensor Enabled", presentState="Sensor Normal",
+#           presentReading=42 (CPU temp 42°C)
 
-pldmtool platform GetSensorReading -m 10 --sensor-id 2
-# Expected: presentReading=1198, unitModifier=-2 → 11.98 V (12V rail)
+pldmtool platform GetSensorReading -m 10 -i 2 -r 0
+# Expected: presentReading=1198 → unitModifier=-2 means 11.98 V (12V rail)
 ```
 
 ### 5. Verify pldmd service is running
 
 ```bash
 systemctl status pldmd.service
-busctl status xyz.openbmc_project.PLDM
 journalctl -u pldmd.service -n 50 | grep -i "sensor\|pdr\|discover"
 ```
+
+Note: `pldmd`'s own autonomous `platform-mc` manager currently fails its internal
+discovery (`GetPLDMCommands` unsupported — see [Architecture.md § Known Gaps](Architecture.md#known-gaps)),
+so it will not expose the sensors as D-Bus objects on its own. This does not affect the
+manual `pldmtool` commands above, which talk to the device directly.
 
 ### Troubleshooting
 
@@ -589,18 +414,26 @@ dmesg | grep -i "mctp\|i2c"
 cat /proc/device-tree/ahb/apb/i2c@1e78a080/mctp-controller 2>/dev/null && echo present
 ```
 
-**If mctpd does not assign EID 10:**
+**If `mctp neigh show` does not show EID 10:**
 ```bash
 journalctl -u mctpd.service | tail -30
 # Verify mctpd.conf: mode = "bus-owner"
+
+systemctl status mctp-discover-terminus.service
+# This service calls AssignEndpointStatic against mctpd; if it failed, retry manually:
+busctl call au.com.codeconstruct.MCTP1 \
+    /au/com/codeconstruct/mctp1/interfaces/mctpi2c1 \
+    au.com.codeconstruct.MCTP.BusOwner1 AssignEndpointStatic ayy 1 0x0f 10
 ```
 
-**If pldmd discovery fails:**
+**If `pldmd` logs discovery errors:** this is expected — see [Architecture.md § Known Gaps](Architecture.md#known-gaps).
+It does not affect manual `pldmtool` queries; use those to verify the real path instead:
 ```bash
 journalctl -u pldmd.service | tail -50
-systemctl status mctpd.service mctp-setup-i2c.service
+systemctl status mctpd.service mctp-setup-i2c.service mctp-discover-terminus.service
 ```
 
 ---
 
-For more details, refer to the README files in each subdirectory and the OpenBMC documentation.
+For source code layout, the QEMU device model internals, and the full bug-fix history,
+see [Architecture.md](Architecture.md). For more details, refer to the OpenBMC documentation.

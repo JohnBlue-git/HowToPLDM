@@ -5,6 +5,7 @@ FILESEXTRAPATHS:prepend := "${THISDIR}/files:"
 SRC_URI:append = " \
     file://mctpd.conf \
     file://mctp-setup-i2c.service \
+    file://mctp-discover-terminus.service \
 "
 
 do_install:append() {
@@ -14,6 +15,8 @@ do_install:append() {
     install -d ${D}${systemd_system_unitdir}
     install -m 0644 ${UNPACKDIR}/mctp-setup-i2c.service \
         ${D}${systemd_system_unitdir}/mctp-setup-i2c.service
+    install -m 0644 ${UNPACKDIR}/mctp-discover-terminus.service \
+        ${D}${systemd_system_unitdir}/mctp-discover-terminus.service
 }
 
-SYSTEMD_SERVICE:${PN} += "mctp-setup-i2c.service"
+SYSTEMD_SERVICE:${PN} += "mctp-setup-i2c.service mctp-discover-terminus.service"

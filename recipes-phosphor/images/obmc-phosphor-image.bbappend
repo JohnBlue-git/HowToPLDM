@@ -17,5 +17,4 @@ IMAGE_INSTALL:append = " \
     i2c-tools \
     strace \
     gdbserver \
-    pldm-terminus \
 "

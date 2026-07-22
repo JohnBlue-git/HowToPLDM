@@ -54,7 +54,7 @@ Signed-off-by: johnblue <dev@johnblue>
    'aspeed_ast2600_gb200nvl.c',
 --- a/include/hw/i2c/mctp_i2c_endpoint.h
 +++ b/include/hw/i2c/mctp_i2c_endpoint.h
-@@ -0,0 +1,80 @@
+@@ -0,0 +1,87 @@
 +/*
 + * MCTP-over-SMBus/I2C Endpoint Device Model
 + *
@@ -65,13 +65,14 @@ Signed-off-by: johnblue <dev@johnblue>
 + * Wire protocol for each I2C transaction (master writes to slave at address
 + * TERMINUS_I2C_ADDR):
 + *
-+ *   [0]  byte_count       (remaining bytes, NOT including this byte or PEC)
-+ *   [1]  source_addr<<1 | 1   (slave address of sender, lsb=1 for SMBus)
-+ *   [2]  flags_hdr_ver    (bits 7-4: flags, bits 1-0: hdr_ver=1)
-+ *   [3]  dest_eid
-+ *   [4]  src_eid
-+ *   [5]  tag_field        (TO|seq|EOM|SOM|tag)
-+ *   [6+] mctp_payload     (type byte + message body)
++ *   [0]  command          (fixed DSP0237 SMBus command code, MCTP_I2C_COMMANDCODE)
++ *   [1]  byte_count       (remaining bytes, NOT including command/byte_count or PEC)
++ *   [2]  source_addr<<1 | 1   (slave address of sender, lsb=1 for SMBus)
++ *   [3]  flags_hdr_ver    (bits 7-4: flags, bits 1-0: hdr_ver=1)
++ *   [4]  dest_eid
++ *   [5]  src_eid
++ *   [6]  tag_field        (TO|seq|EOM|SOM|tag)
++ *   [7+] mctp_payload     (type byte + message body)
 + *   [-1] pec              (CRC-8 over entire transaction)
 + *
 + * Responses are sent back as async slave-initiated writes to the BMC's
@@ -111,6 +112,10 @@ Signed-off-by: johnblue <dev@johnblue>
 + * @resp_len:    bytes to send in response
 + * @resp_pos:    bytes already pushed via i2c_send_async
 + * @bh:          bottom-half for async response delivery
++ * @resp_timer:  paces response bytes at roughly SCL-clock intervals so the
++ *               guest's real interrupt-driven ISR gets a chance to service
++ *               each byte, matching real hardware (an immediate BH
++ *               reschedule can fire again before the vCPU thread ever runs)
 + * @bus_ref:     pointer back to the I2C bus (for master-role response write)
 + * @eid:         this endpoint's MCTP EID (set by mctpd via SetEndpointID)
 + * @tid:         PLDM Terminus ID
@@ -126,18 +131,27 @@ Signed-off-by: johnblue <dev@johnblue>
 +    uint8_t  resp_buf[MCTP_MAX_I2C_FRAME];
 +    uint16_t resp_len;
 +    uint16_t resp_pos;
++    bool     resp_addr_sent;
 +
-+    QEMUBH  *bh;
-+    I2CBus  *bus_ref;
++    QEMUBH    *bh;
++    QEMUTimer *resp_timer;
++    I2CBus    *bus_ref;
 +
 +    uint8_t  eid;   /* our assigned EID (0 = unassigned) */
 +    uint8_t  tid;   /* PLDM TID */
 +};
 +
 +#endif /* QEMU_MCTP_I2C_ENDPOINT_H */
++
++    uint8_t  eid;   /* our assigned EID (0 = unassigned) */
++    uint8_t  tid;   /* PLDM TID */
++};
++
++#endif /* QEMU_MCTP_I2C_ENDPOINT_H */
++#endif /* QEMU_MCTP_I2C_ENDPOINT_H */
 --- a/hw/i2c/mctp_i2c_endpoint.c
 +++ b/hw/i2c/mctp_i2c_endpoint.c
-@@ -0,0 +1,855 @@
+@@ -0,0 +1,964 @@
 +/*
 + * MCTP-over-SMBus/I2C Endpoint Device Model
 + *
@@ -163,6 +177,7 @@ Signed-off-by: johnblue <dev@johnblue>
 +#include "qemu/module.h"
 +#include "qemu/bswap.h"
 +#include "qemu/main-loop.h"
++#include "qemu/timer.h"
 +#include "hw/i2c/i2c.h"
 +#include "hw/i2c/mctp_i2c_endpoint.h"
 +#include "qom/object.h"
@@ -179,6 +194,11 @@ Signed-off-by: johnblue <dev@johnblue>
 +
 +/* MCTP header version */
 +#define MCTP_HDR_VER            0x01
++
++/* DSP0237 fixed SMBus command code for MCTP-over-SMBus (always 0x0F,
++ * unrelated to any device's I2C address, despite sharing the numeric
++ * value 0x0f with TERMINUS_I2C_ADDR in this configuration). */
++#define MCTP_I2C_COMMANDCODE    0x0f
 +
 +/* MCTP message type bytes */
 +#define MCTP_TYPE_CONTROL       0x00
@@ -245,7 +265,7 @@ Signed-off-by: johnblue <dev@johnblue>
 +    uint16_t sensor_id;
 +    uint16_t entity_type;
 +    uint16_t entity_instance;
-+    uint8_t  container_id;        /* 0 */
++    uint16_t container_id;        /* 0 -- 2 bytes per DSP0248 Table 78, not 1 */
 +    uint8_t  sensor_init;         /* 0x01 = enabled */
 +    uint8_t  sensor_auxiliary_names_pdr; /* 0 */
 +    /* data info */
@@ -256,6 +276,8 @@ Signed-off-by: johnblue <dev@johnblue>
 +    uint8_t  aux_unit;            /* 0 */
 +    int8_t   aux_unit_modifier;   /* 0 */
 +    uint8_t  aux_rate_unit;       /* 0 */
++    uint8_t  rel;                 /* 0 -- present in DSP0248 Table 78, was missing */
++    uint8_t  aux_oem_unit_handle; /* 0 -- present in DSP0248 Table 78, was missing */
 +    uint8_t  is_linear;           /* 1 = linear */
 +    uint8_t  sensor_data_size;    /* 2 = uint16 */
 +    float    resolution;          /* 1.0 */
@@ -263,13 +285,19 @@ Signed-off-by: johnblue <dev@johnblue>
 +    uint16_t accuracy;
 +    uint8_t  plus_tolerance;
 +    uint8_t  minus_tolerance;
-+    uint32_t hysteresis;
++    /*
++     * hysteresis/max_readable/min_readable are sized per sensor_data_size
++     * (union_sensor_data_size in libpldm) -- 2 bytes here since
++     * sensor_data_size is fixed at uint16 (0x02) for both our sensors, not
++     * a fixed uint32_t.
++     */
++    uint16_t hysteresis;
 +    uint8_t  supported_thresholds;
 +    uint8_t  threshold_and_hysteresis_volatility;
 +    float    state_transition_interval;
 +    float    update_interval;
-+    uint32_t max_readable;
-+    uint32_t min_readable;
++    uint16_t max_readable;
++    uint16_t min_readable;
 +    uint8_t  range_field_format;  /* 2 = uint16 */
 +    uint8_t  range_field_support;
 +    uint16_t nominal_value;
@@ -396,13 +424,14 @@ Signed-off-by: johnblue <dev@johnblue>
 + * Frame builder: prepend DSP0237 SMBus header + append PEC
 + *
 + * Layout of resp_buf:
-+ *   [0]  byte_count       = total_bytes − 1  (excluding byte_count itself)
-+ *   [1]  source_addr<<1|1 = (TERMINUS_I2C_ADDR << 1) | 1
-+ *   [2]  flags_hdr_ver    = SOM|EOM (0xC0) | hdr_ver (0x01) = 0xC1
-+ *   [3]  dest_eid
-+ *   [4]  src_eid  (our EID)
-+ *   [5]  tag_field (TO=0, same tag as request)
-+ *   [6+] mctp_payload
++ *   [0]  command          = MCTP_I2C_COMMANDCODE (fixed 0x0f)
++ *   [1]  byte_count       = total_bytes − 1  (excluding byte_count itself)
++ *   [2]  source_addr<<1|1 = (TERMINUS_I2C_ADDR << 1) | 1
++ *   [3]  flags_hdr_ver    = SOM|EOM (0xC0) | hdr_ver (0x01) = 0xC1
++ *   [4]  dest_eid
++ *   [5]  src_eid  (our EID)
++ *   [6]  tag_field (TO=0, same tag as request)
++ *   [7+] mctp_payload
 + *   [-1] PEC
 + *
 + * The PEC covers the entire I2C transaction:
@@ -418,24 +447,52 @@ Signed-off-by: johnblue <dev@johnblue>
 +    uint8_t *b = s->resp_buf;
 +    uint16_t idx = 0;
 +
-+    /* SMBus header */
-+    uint8_t total_bytes = 1 /* src_addr */ + 4 /* hdr */ + plen + 1 /* PEC */;
++    /*
++     * SMBus header. byte_count covers everything AFTER the byte_count
++     * field itself up to (but excluding) the PEC -- i.e. source_slave_addr
++     * + the 4-byte MCTP header + the payload. It must NOT include the PEC
++     * byte: the kernel's own receive validation (mctp_i2c_recv) checks
++     * `hdr->byte_count + offsetof(source_slave) == recvlen`, where recvlen
++     * already excludes the PEC. Adding +1 for the PEC here (as DSP0237's
++     * general SMBus byte_count semantics might suggest) makes byte_count
++     * one larger than the kernel expects, so every response is rejected
++     * with a length mismatch even though every byte was received intact.
++     */
++    uint8_t total_bytes = 1 /* src_addr */ + 4 /* hdr */ + plen;
++    b[idx++] = MCTP_I2C_COMMANDCODE;            /* command */
 +    b[idx++] = total_bytes;                     /* byte_count */
 +    b[idx++] = (TERMINUS_I2C_ADDR << 1) | 0x01;/* src_slave_addr */
-+    b[idx++] = 0xC0 | MCTP_HDR_VER;            /* flags: SOM+EOM + ver */
++    b[idx++] = MCTP_HDR_VER;                   /* MCTP transport hdr: rsvd(0)|ver */
 +    b[idx++] = dest_eid;
 +    b[idx++] = src_eid;
-+    b[idx++] = tag & MCTP_TAG_MASK;            /* TO=0, same tag */
++    /*
++     * MCTP transport header's 4th byte is SOM|EOM|PktSeq|TO|Msg-tag, not the
++     * bare tag value -- this response is always a single packet (SOM=EOM=1)
++     * with TO=0 (tag was allocated by the requester). Previously this byte
++     * held only "tag & MCTP_TAG_MASK" while 0xC0 was (wrongly) OR'd into the
++     * version byte above instead, so the kernel's MCTP core received a
++     * response with a corrupt header (bogus reserved bits in the version
++     * byte, and no SOM/EOM on the tag byte) and silently dropped it even
++     * though the I2C-layer framing/PEC checks passed.
++     */
++    b[idx++] = 0xC0 | (tag & MCTP_TAG_MASK);   /* SOM=1 EOM=1 TO=0 + tag */
 +
 +    /* MCTP payload */
 +    memcpy(&b[idx], payload, plen);
 +    idx += plen;
 +
-+    /* PEC over: (BMC_slave_addr<<1)|0 || byte_count ... payload */
++    /*
++     * PEC over: (BMC_slave_addr<<1)|0 || command || byte_count ... payload.
++     * pec_buf holds 1 (address) + idx (everything built so far) valid
++     * bytes; the length passed to crc8_smbus must be that same count, not
++     * one less -- "1 + idx - 1" silently dropped the last payload byte
++     * from the CRC, so every response failed the kernel's PEC check even
++     * though byte_count/length validation passed.
++     */
 +    uint8_t pec_buf[MCTP_MAX_I2C_FRAME + 1];
 +    pec_buf[0] = (BMC_I2C_SLAVE_ADDR << 1) & 0xFE; /* write address */
 +    memcpy(&pec_buf[1], b, idx);
-+    b[idx++] = crc8_smbus(pec_buf, 1 + idx - 1);
++    b[idx++] = crc8_smbus(pec_buf, 1 + idx);
 +
 +    return idx;
 +}
@@ -766,11 +823,11 @@ Signed-off-by: johnblue <dev@johnblue>
 +
 +        payload[olen++] = PLDM_CC_SUCCESS;
 +        payload[olen++] = 0x02;     /* sensor_data_size = uint16 */
-+        payload[olen++] = 0x01;     /* operational_state = enabled */
-+        payload[olen++] = 0x00;     /* event_msg_enable */
-+        payload[olen++] = 0x00;     /* present_state = Normal */
-+        payload[olen++] = 0x00;     /* previous_state */
-+        payload[olen++] = 0x00;     /* event_state */
++        payload[olen++] = 0x00;     /* operational_state = PLDM_SENSOR_ENABLED */
++        payload[olen++] = 0x00;     /* event_msg_enable = PLDM_NO_EVENT_GENERATION */
++        payload[olen++] = 0x01;     /* present_state = PLDM_SENSOR_NORMAL (0x00 is Unknown) */
++        payload[olen++] = 0x01;     /* previous_state = PLDM_SENSOR_NORMAL */
++        payload[olen++] = 0x01;     /* event_state = PLDM_SENSOR_NORMAL */
 +        memcpy(&payload[olen], &reading, 2); olen += 2;
 +        break;
 +    }
@@ -795,19 +852,26 @@ Signed-off-by: johnblue <dev@johnblue>
 +    uint16_t flen  = s->rx_len;
 +
 +    /*
-+     * Minimum frame: byte_count(1) src_addr(1) hdr(1) dst_eid(1)
-+     *                src_eid(1) tag(1) type(1) = 7 bytes (+ optional PEC)
++     * Minimum frame: command(1) byte_count(1) src_addr(1) hdr(1) dst_eid(1)
++     *                src_eid(1) tag(1) type(1) = 8 bytes (+ optional PEC)
 +     */
-+    if (flen < 7) {
++    if (flen < 8) {
 +        qemu_log_mask(LOG_GUEST_ERROR,
 +                      "mctp-i2c-endpoint: short frame (%u bytes)\n", flen);
 +        return;
 +    }
 +
-+    uint8_t byte_count  = frame[0];
++    if (frame[0] != MCTP_I2C_COMMANDCODE) {
++        qemu_log_mask(LOG_GUEST_ERROR,
++                      "mctp-i2c-endpoint: bad command code 0x%02x\n",
++                      frame[0]);
++        return;
++    }
++
++    uint8_t byte_count  = frame[1];
 +
 +    /* Validate byte_count covers at least our header */
-+    if ((uint16_t)byte_count + 1 > flen) {
++    if ((uint16_t)byte_count + 3 > flen) {
 +        qemu_log_mask(LOG_GUEST_ERROR,
 +                      "mctp-i2c-endpoint: byte_count %u > frame len %u\n",
 +                      byte_count, flen);
@@ -815,14 +879,14 @@ Signed-off-by: johnblue <dev@johnblue>
 +    }
 +
 +    /* Strip PEC (last byte) from consideration for payload */
-+    /* frame[1] = src_slave_addr, frame[2] = flags_hdr_ver */
-+    uint8_t dst_eid  = frame[3];
-+    uint8_t src_eid  = frame[4];
-+    uint8_t tag_fld  = frame[5];
++    /* frame[2] = src_slave_addr, frame[3] = flags_hdr_ver */
++    uint8_t dst_eid  = frame[4];
++    uint8_t src_eid  = frame[5];
++    uint8_t tag_fld  = frame[6];
 +
-+    /* Message starts at frame[6] */
-+    const uint8_t *msg     = &frame[6];
-+    uint16_t        msg_len = flen - 6 - 1; /* exclude PEC */
++    /* Message starts at frame[7] */
++    const uint8_t *msg     = &frame[7];
++    uint16_t        msg_len = flen - 7 - 1; /* exclude PEC */
 +
 +    if (msg_len < 1) {
 +        return;
@@ -855,12 +919,37 @@ Signed-off-by: johnblue <dev@johnblue>
 +}
 +
 +/* -----------------------------------------------------------------------
-+ * Bottom-half: push response bytes into Aspeed I2C slave DMA
++ * Bottom-half / timer: push response bytes into Aspeed I2C slave DMA
 + *
 + * The BH does an async master-write to BMC_I2C_SLAVE_ADDR so that the
 + * Aspeed I2C DMA slave path (I2C_START_SEND_ASYNC / send_async) fires
 + * the kernel's mctp-i2c receive ISR.
++ *
++ * The Aspeed old-mode slave-receive path delivers one byte per interrupt
++ * (byte sits in a single-byte register until the guest's ISR services
++ * it). QEMU device callbacks run with the BQL held, so a tight loop that
++ * pushes every byte in one invocation never lets the guest vCPU run in
++ * between -- the kernel's ISR only ever observes the last byte and the
++ * frame is silently lost. An immediate qemu_bh_schedule() reschedule is
++ * not sufficient either: nothing guarantees the vCPU thread gets a turn
++ * before the BH fires again. Space successive bytes out on a virtual-
++ * clock timer (roughly one SCL byte-time apart, matching how real
++ * hardware paces slave-receive interrupts) so the main loop reliably
++ * lets the guest's ISR run between bytes.
 + * --------------------------------------------------------------------- */
++
++/*
++ * How long to space successive response bytes apart on the virtual clock.
++ * Real 100kHz I2C would only need ~100us/byte, but kernel-side tracing
++ * (dynamic debug on aspeed_i2c_slave_irq) showed the guest's interrupt
++ * handler only actually ran 3 times for a 15-byte response at 100us
++ * spacing -- most bytes were silently overwritten in the single-byte
++ * hardware register before the guest's ISR was scheduled to read them.
++ * 20ms gives the guest's IRQ handling ample real wall-clock time to run
++ * between every byte; even at the max frame size this adds well under
++ * a second, far inside mctpd's 5s per-message timeout.
++ */
++#define MCTP_I2C_BYTE_TIME_NS   (20 * 1000 * 1000)   /* 20ms per byte */
 +
 +static void mctp_i2c_resp_bh(void *opaque)
 +{
@@ -870,22 +959,53 @@ Signed-off-by: johnblue <dev@johnblue>
 +        return;
 +    }
 +
-+    /* Initiate async master write to BMC slave address */
-+    if (i2c_start_send_async(s->bus_ref, BMC_I2C_SLAVE_ADDR) != 0) {
-+        qemu_log_mask(LOG_GUEST_ERROR,
-+                      "mctp-i2c-endpoint: could not start async send to "
-+                      "BMC slave 0x%02x\n", BMC_I2C_SLAVE_ADDR);
++    if (!s->resp_addr_sent) {
++        /*
++         * Initiate async master write to the BMC slave address. This is
++         * its own paced step, separate from sending the first data byte:
++         * the address phase and byte 0 both write the same single-byte
++         * hardware register (I2CD_BYTE_BUF), so doing them back-to-back
++         * with no delay overwrites the address-phase value before the
++         * guest's ISR ever reads it. The guest then misreads the *data*
++         * byte's value as the address/R-W byte -- since MCTP command
++         * bytes routinely have their LSB set, this randomly misclassifies
++         * the transaction as a slave-read instead of a slave-write.
++         */
++        if (i2c_start_send_async(s->bus_ref, BMC_I2C_SLAVE_ADDR) != 0) {
++            qemu_log_mask(LOG_GUEST_ERROR,
++                          "mctp-i2c-endpoint: could not start async send to "
++                          "BMC slave 0x%02x\n", BMC_I2C_SLAVE_ADDR);
++            s->resp_len = 0;
++            return;
++        }
++        s->resp_addr_sent = true;
++        timer_mod(s->resp_timer,
++                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + MCTP_I2C_BYTE_TIME_NS);
 +        return;
 +    }
 +
-+    for (uint16_t i = 0; i < s->resp_len; i++) {
-+        i2c_send_async(s->bus_ref, s->resp_buf[i]);
++    if (s->resp_pos >= s->resp_len) {
++        /*
++         * All bytes delivered. End the transfer (raising the STOP
++         * condition) only now, a full byte-time after the last data byte,
++         * not synchronously in the same invocation that sent it -- with
++         * zero delay in between, the guest's ISR does not reliably get a
++         * chance to fully service the last byte's interrupt before the
++         * STOP interrupt arrives, and the two can be coalesced/lost the
++         * same way un-paced data bytes were.
++         */
++        i2c_end_transfer(s->bus_ref);
++        s->resp_len = 0;
++        s->resp_pos = 0;
++        s->resp_addr_sent = false;
++        return;
 +    }
 +
-+    i2c_end_transfer(s->bus_ref);
++    i2c_send_async(s->bus_ref, s->resp_buf[s->resp_pos]);
++    s->resp_pos++;
 +
-+    s->resp_len = 0;
-+    s->resp_pos = 0;
++    timer_mod(s->resp_timer,
++              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + MCTP_I2C_BYTE_TIME_NS);
 +}
 +
 +/* -----------------------------------------------------------------------
@@ -949,16 +1069,19 @@ Signed-off-by: johnblue <dev@johnblue>
 +    s->rx_len  = 0;
 +    s->resp_len = 0;
 +    s->resp_pos = 0;
++    s->resp_addr_sent = false;
 +
 +    /* Obtain a pointer to our parent I2C bus for the response BH */
 +    s->bus_ref = I2C_BUS(qdev_get_parent_bus(dev));
 +
 +    s->bh = qemu_bh_new(mctp_i2c_resp_bh, s);
++    s->resp_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, mctp_i2c_resp_bh, s);
 +}
 +
 +static void mctp_i2c_ep_unrealize(DeviceState *dev)
 +{
 +    MCTPEndpointState *s = MCTP_I2C_ENDPOINT(dev);
++    timer_free(s->resp_timer);
 +    qemu_bh_delete(s->bh);
 +}
 +

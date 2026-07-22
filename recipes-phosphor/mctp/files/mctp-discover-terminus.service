@@ -1,0 +1,26 @@
+[Unit]
+Description=Discover the QEMU MCTP/PLDM terminus over I2C (real SetEndpointID)
+After=mctp-setup-i2c.service
+Wants=mctp-setup-i2c.service
+Before=pldmd.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+
+# Trigger mctpd's real bus-owner EID assignment handshake against the QEMU
+# mctp-i2c-endpoint device at physical I2C address 0x0f (TERMINUS_I2C_ADDR).
+# This performs an actual DSP0236 Get/Set Endpoint ID exchange over the wire,
+# assigning EID 10 to the device to match /usr/share/pldm/host_eid. A few
+# retries are allowed since mctpd may still be processing the netlink event
+# for the newly-created mctpi2c1 interface.
+ExecStart=/bin/sh -c 'for i in $(seq 1 5); do \
+    busctl call au.com.codeconstruct.MCTP1 \
+        /au/com/codeconstruct/mctp1/interfaces/mctpi2c1 \
+        au.com.codeconstruct.MCTP.BusOwner1 AssignEndpointStatic ayy 1 0x0f 10 \
+        && exit 0; \
+    sleep 1; \
+done; echo "failed to discover terminus at 0x0f" >&2; exit 1'
+
+[Install]
+WantedBy=multi-user.target
